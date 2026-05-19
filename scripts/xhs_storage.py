@@ -125,6 +125,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE notes ADD COLUMN image_summary TEXT DEFAULT ''")
     if "image_mermaid" not in cols:
         conn.execute("ALTER TABLE notes ADD COLUMN image_mermaid TEXT DEFAULT ''")
+    if "content_hash" not in cols:
+        conn.execute("ALTER TABLE notes ADD COLUMN content_hash TEXT DEFAULT ''")
     conn.commit()
 
 
@@ -132,6 +134,8 @@ def connect() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+    # WAL 模式允许读写并发，大幅减少 "database is locked"
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(SCHEMA)
     _migrate(conn)
     return conn
@@ -147,12 +151,22 @@ def _create_in_memory() -> sqlite3.Connection:
 
 
 def upsert_note(conn: sqlite3.Connection, note: dict[str, Any]) -> None:
+    content_hash = note.get("content_hash", "")
+    # 增量跳过：如果 content_hash 相同则不更新
+    if content_hash:
+        existing = conn.execute(
+            "SELECT content_hash FROM notes WHERE note_id = ?",
+            (note.get("note_id"),),
+        ).fetchone()
+        if existing and existing["content_hash"] == content_hash:
+            return  # 无变更，跳过
+
     cols = (
         "note_id user_id title description type liked_count collected_count "
         "comment_count share_count ip_location topics published_at "
         "xsec_token xsec_source video_url cover_url video_duration "
         "video_transcript video_ocr_text video_summary "
-        "image_ocr_text image_summary image_mermaid raw_json"
+        "image_ocr_text image_summary image_mermaid raw_json content_hash"
     ).split()
     values = [
         note.get("note_id"),
@@ -179,6 +193,7 @@ def upsert_note(conn: sqlite3.Connection, note: dict[str, Any]) -> None:
         note.get("image_summary", ""),
         note.get("image_mermaid", ""),
         json.dumps(note.get("raw", {}), ensure_ascii=False),
+        content_hash,
     ]
     placeholders = ",".join("?" * len(cols))
     # 用 INSERT...ON CONFLICT，避免 INSERT OR REPLACE 把已有字段清成空
@@ -200,7 +215,7 @@ def upsert_note(conn: sqlite3.Connection, note: dict[str, Any]) -> None:
         f"image_ocr_text=CASE WHEN excluded.image_ocr_text != '' THEN excluded.image_ocr_text ELSE notes.image_ocr_text END, "
         f"image_summary=CASE WHEN excluded.image_summary != '' THEN excluded.image_summary ELSE notes.image_summary END, "
         f"image_mermaid=CASE WHEN excluded.image_mermaid != '' THEN excluded.image_mermaid ELSE notes.image_mermaid END, "
-        f"raw_json=excluded.raw_json, crawled_at=CURRENT_TIMESTAMP",
+        f"raw_json=excluded.raw_json, content_hash=excluded.content_hash, crawled_at=CURRENT_TIMESTAMP",
         values,
     )
 
@@ -403,11 +418,11 @@ def render_markdown(conn: sqlite3.Connection, note_id: str) -> str:
     local_images = sorted(media_dir.glob("img_*")) if media_dir.exists() else []
     local_video = next(iter(media_dir.glob("video.*")), None) if media_dir.exists() else None
     if local_images:
-        images = [str(Path("..") / media_dir.relative_to(OUTPUT_DIR.parent) / p.name) for p in local_images]
+        images = [str(Path("..") / media_dir.relative_to(OUTPUT_DIR.parent) / p.name).replace("\\", "/") for p in local_images]
     else:
         images = _extract_images(raw)
     if local_video:
-        video_url = str(Path("..") / media_dir.relative_to(OUTPUT_DIR.parent) / local_video.name)
+        video_url = str(Path("..") / media_dir.relative_to(OUTPUT_DIR.parent) / local_video.name).replace("\\", "/")
     else:
         video_url = _extract_video_url(raw)
 
@@ -468,7 +483,7 @@ def render_markdown(conn: sqlite3.Connection, note_id: str) -> str:
             # 优先本地封面
             local_cover = next(iter(media_dir.glob("cover.*")), None) if media_dir.exists() else None
             if local_cover:
-                cover_ref = str(Path("..") / media_dir.relative_to(OUTPUT_DIR.parent) / local_cover.name)
+                cover_ref = str(Path("..") / media_dir.relative_to(OUTPUT_DIR.parent) / local_cover.name).replace("\\", "/")
             else:
                 cover_ref = cover
             lines.append(f"![封面]({cover_ref})")
@@ -682,6 +697,72 @@ def write_csv(conn: sqlite3.Connection, path: Path | None = None) -> Path:
                 "待处理",
                 "",
             ])
+    return path
+
+
+def write_json(conn: sqlite3.Connection, path: Path | None = None) -> Path:
+    """导出全部笔记为 JSON 文件。"""
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    date_str = datetime.now().strftime('%Y%m%d_%H%M%S')
+    path = path or (OUTPUT_DIR / f"xhs_export_{date_str}.json")
+    notes = []
+    for note in iter_notes(conn):
+        d = dict(note)
+        # 解析 JSON 字段
+        d["topics"] = json.loads(d.get("topics") or "[]")
+        d["raw_json"] = json.loads(d.get("raw_json") or "{}")
+        notes.append(d)
+    path.write_text(
+        json.dumps(notes, ensure_ascii=False, indent=2, default=str),
+        encoding="utf-8",
+    )
+    return path
+
+
+def write_xlsx(conn: sqlite3.Connection, path: Path | None = None) -> Path:
+    """导出全部笔记为 XLSX 文件（多 sheet: notes / users / comments）。需要 openpyxl。"""
+    try:
+        import openpyxl  # type: ignore
+    except ImportError:
+        print("[ERR] 导出 xlsx 需要 openpyxl。pip install openpyxl", file=sys.stderr)
+        raise
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    date_str = datetime.now().strftime('%Y%m%d_%H%M%S')
+    path = path or (OUTPUT_DIR / f"xhs_export_{date_str}.xlsx")
+    wb = openpyxl.Workbook()
+
+    # Sheet 1: Notes
+    ws_notes = wb.active
+    ws_notes.title = "Notes"
+    note_cols = [
+        "note_id", "user_id", "title", "description", "type",
+        "liked_count", "collected_count", "comment_count", "share_count",
+        "ip_location", "published_at", "xsec_token",
+        "video_url", "cover_url", "video_duration",
+        "video_summary", "image_ocr_text", "image_summary",
+        "crawled_at",
+    ]
+    ws_notes.append(note_cols)
+    for note in iter_notes(conn):
+        ws_notes.append([note.get(c, "") for c in note_cols])
+
+    # Sheet 2: Users
+    ws_users = wb.create_sheet("Users")
+    user_cols = ["user_id", "nickname", "avatar", "fans_count", "notes_count", "desc"]
+    ws_users.append(user_cols)
+    for row in conn.execute("SELECT * FROM users ORDER BY fans_count DESC"):
+        d = dict(row)
+        ws_users.append([d.get(c, "") for c in user_cols])
+
+    # Sheet 3: Comments
+    ws_comments = wb.create_sheet("Comments")
+    comment_cols = ["comment_id", "note_id", "content", "nickname", "like_count", "created_at"]
+    ws_comments.append(comment_cols)
+    for row in conn.execute("SELECT * FROM comments ORDER BY created_at DESC"):
+        d = dict(row)
+        ws_comments.append([d.get(c, "") for c in comment_cols])
+
+    wb.save(path)
     return path
 
 

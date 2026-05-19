@@ -305,7 +305,10 @@ def summarize_local(transcript: str, ocr_results: list[dict], frame_paths: list[
 
     # 取 top 句子
     scored.sort(key=lambda x: x[0], reverse=True)
-    top = sorted(scored[:min(8, len(scored))], key=lambda x: sentences.index(x[1]))
+    top_n = min(8, len(scored))
+    # 用 enumerate 避免重复句子的 index 问题
+    sent_positions = {s: i for i, s in enumerate(sentences)}
+    top = sorted(scored[:top_n], key=lambda x: sent_positions.get(x[1], 0))
     summary = "。".join(s for _, s in top) + "。"
 
     # 补充 OCR 信息
@@ -477,8 +480,8 @@ def summarize_openai(
         )
         resp.raise_for_status()
         data = resp.json()
-        content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
-        return content.strip() or summarize_local(transcript, ocr_results, frame_paths)
+        reply = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
+        return reply.strip() or summarize_local(transcript, ocr_results, frame_paths)
     except Exception as e:
         _msg(f"OpenAI API 调用失败: {e}")
         return summarize_local(transcript, ocr_results, frame_paths)
@@ -519,9 +522,22 @@ def generate_summary(
 def analyze_video(
     video_path: Path,
     cfg: dict[str, Any] | None = None,
+    steps: list[str] | None = None,
 ) -> dict[str, Any]:
-    """分析单个视频文件，返回完整结果。"""
+    """分析单个视频文件，返回完整结果。
+
+    steps: 控制执行哪些阶段，None 表示全部执行。
+           ["extract"]  → 仅提取音频+关键帧
+           ["transcribe"] → 仅转录（需先 extract）
+           ["ocr"]      → 仅 OCR（需先 extract）
+           ["summary"]  → 仅生成摘要（需先 transcribe/ocr）
+           支持任意组合，如 ["extract", "transcribe"]
+    """
     cfg = cfg or load_config()
+    all_steps = steps is None
+    cache_dir = video_path.parent / "_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
     result: dict[str, Any] = {
         "transcript": "",
         "segments": [],
@@ -531,60 +547,103 @@ def analyze_video(
         "keyframes": 0,
     }
 
-    # 1. 提取音频 + 转录
-    if has_ffmpeg() and has_whisper():
+    # 加载已有缓存结果
+    audio_cache = cache_dir / "audio.wav"
+    transcript_cache = cache_dir / "transcript.json"
+    ocr_cache = cache_dir / "ocr.json"
+
+    if transcript_cache.exists():
         try:
-            audio_path = extract_audio(video_path)
+            d = json.loads(transcript_cache.read_text(encoding="utf-8"))
+            result["transcript"] = d.get("text", "")
+            result["segments"] = d.get("segments", [])
+            result["audio_duration"] = d.get("duration", 0.0)
+        except Exception:
+            pass
+    if ocr_cache.exists():
+        try:
+            result["ocr_results"] = json.loads(ocr_cache.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    # 1. 提取音频 + 关键帧（extract 步骤）
+    if all_steps or "extract" in steps:
+        if has_ffmpeg():
             try:
-                whisper_result = transcribe(audio_path, cfg.get("whisper_model", "base"))
+                _msg("提取音频...")
+                extract_audio(video_path, output_path=audio_cache)
+                _msg(f"音频已缓存: {audio_cache}")
+            except Exception as e:
+                _msg(f"音频提取失败: {e}")
+            try:
+                frame_dir = cache_dir / "frames"
+                frame_paths = extract_keyframes(
+                    video_path, frame_dir, cfg.get("frame_interval", 5)
+                )
+                result["keyframes"] = len(frame_paths)
+                _msg(f"关键帧已缓存: {len(frame_paths)} 帧")
+            except Exception as e:
+                _msg(f"关键帧提取失败: {e}")
+        else:
+            _msg("跳过提取（缺少 ffmpeg）")
+
+    # 2. 转录（transcribe 步骤）
+    if all_steps or "transcribe" in steps:
+        if audio_cache.exists() and has_whisper():
+            try:
+                whisper_result = transcribe(audio_cache, cfg.get("whisper_model", "base"))
                 result["transcript"] = whisper_result["text"]
                 result["segments"] = whisper_result["segments"]
                 result["audio_duration"] = whisper_result["duration"]
-            finally:
-                audio_path.unlink(missing_ok=True)
-        except Exception as e:
-            _msg(f"转录失败: {e}")
-    else:
-        missing = []
-        if not has_ffmpeg():
-            missing.append("ffmpeg")
-        if not has_whisper():
-            missing.append("faster-whisper")
-        _msg(f"跳过转录（缺少: {', '.join(missing)}）")
+                # 缓存转录结果
+                transcript_cache.write_text(json.dumps(whisper_result, ensure_ascii=False, indent=2), encoding="utf-8")
+                _msg(f"转录已缓存: {len(whisper_result['text'])} 字")
+            except Exception as e:
+                _msg(f"转录失败: {e}")
+        elif not audio_cache.exists():
+            _msg("跳过转录（需先执行 extract 步骤提取音频）")
+        else:
+            _msg("跳过转录（缺少 faster-whisper）")
 
-    # 2. 关键帧 + OCR
-    frame_dir = video_path.parent / "frames"
-    frame_paths: list[Path] = []
-    if has_ffmpeg():
+    # 3. OCR（ocr 步骤）
+    if all_steps or "ocr" in steps:
+        frame_dir = cache_dir / "frames"
+        frame_paths = sorted(frame_dir.glob("frame_*.jpg")) if frame_dir.exists() else []
+        if not frame_paths:
+            # 尝试提取关键帧
+            if has_ffmpeg():
+                try:
+                    frame_paths = extract_keyframes(
+                        video_path, frame_dir, cfg.get("frame_interval", 5)
+                    )
+                except Exception:
+                    pass
+        if frame_paths and has_ocr():
+            try:
+                result["ocr_results"] = ocr_frames(frame_paths)
+                ocr_cache.write_text(json.dumps(result["ocr_results"], ensure_ascii=False, indent=2), encoding="utf-8")
+                _msg(f"OCR 已缓存: {len(result['ocr_results'])} 帧")
+            except Exception as e:
+                _msg(f"OCR 失败: {e}")
+
+    # 4. AI 摘要（summary 步骤）
+    if all_steps or "summary" in steps:
+        frame_dir = cache_dir / "frames"
+        frame_paths = sorted(frame_dir.glob("frame_*.jpg")) if frame_dir.exists() else []
         try:
-            frame_paths = extract_keyframes(
-                video_path, frame_dir, cfg.get("frame_interval", 5)
+            result["summary"] = generate_summary(
+                result["transcript"],
+                result["ocr_results"],
+                frame_paths,
+                cfg,
             )
-            result["keyframes"] = len(frame_paths)
         except Exception as e:
-            _msg(f"关键帧提取失败: {e}")
+            _msg(f"摘要生成失败: {e}")
 
-    if frame_paths and has_ocr():
+    # 清理缓存目录（仅在完整执行时）
+    if all_steps and cache_dir.exists():
         try:
-            result["ocr_results"] = ocr_frames(frame_paths)
-        except Exception as e:
-            _msg(f"OCR 失败: {e}")
-
-    # 3. AI 摘要
-    try:
-        result["summary"] = generate_summary(
-            result["transcript"],
-            result["ocr_results"],
-            frame_paths,
-            cfg,
-        )
-    except Exception as e:
-        _msg(f"摘要生成失败: {e}")
-
-    # 4. 清理临时帧目录
-    if frame_dir.exists():
-        try:
-            shutil.rmtree(frame_dir, ignore_errors=True)
+            shutil.rmtree(cache_dir, ignore_errors=True)
         except Exception:
             pass
 
@@ -673,12 +732,25 @@ def cmd_analyze_video(args) -> int:
         if args.frame_interval:
             cfg["frame_interval"] = args.frame_interval
 
+        # 解析 --step 参数
+        steps = None
+        if hasattr(args, "step") and args.step is not None:
+            valid_steps = {"extract", "transcribe", "ocr", "summary"}
+            steps = [s for s in args.step if s in valid_steps]
+            if not steps:
+                print(f"[WARN] --step 无有效值，执行全部阶段", file=sys.stderr)
+                steps = None
+            else:
+                print(f"[VIDEO] 分段模式: {' → '.join(steps)}", file=sys.stderr)
+                if "transcribe" in steps and "extract" not in steps:
+                    print("[VIDEO] 提示: transcribe 需要 extract 先完成（或音频已缓存）", file=sys.stderr)
+
         # 执行分析
         mode_label = cfg.get("summary_mode", "none")
         if mode_label == "mcp":
             print("[INFO] 使用 MCP 视觉后端（由 AI Agent 提供，零配置）", file=sys.stderr)
         print(f"[VIDEO] 开始分析《{title}》...", file=sys.stderr)
-        result = analyze_video(video_local, cfg)
+        result = analyze_video(video_local, cfg, steps=steps)
 
         # 将结果存入 DB
         ocr_text = " ".join(r["text"] for r in result.get("ocr_results", []))
@@ -691,7 +763,11 @@ def cmd_analyze_video(args) -> int:
         )
 
         # 打印更新内容摘要
-        print(f"\n[OK] 《{title}》视频分析完成，已更新以下内容:")
+        is_partial = steps is not None
+        if is_partial:
+            print(f"\n[OK] 《{title}》分段完成 ({' → '.join(steps)})")
+        else:
+            print(f"\n[OK] 《{title}》视频分析完成:")
         updates = []
         transcript = result.get("transcript", "")
         if transcript:
@@ -708,6 +784,17 @@ def cmd_analyze_video(args) -> int:
             print("     (无新内容)")
         else:
             print(f"     更新项: {'、'.join(updates)}")
+
+        # 分段模式提示下一步
+        if is_partial:
+            all_stages = ["extract", "transcribe", "ocr", "summary"]
+            done = set(steps)
+            remaining = [s for s in all_stages if s not in done]
+            if remaining:
+                next_step = remaining[0]
+                print(f"\n[NEXT] 下一步: python scripts/xhs.py analyze-video {args.note_id} --step {next_step}")
+                if len(remaining) > 1:
+                    print(f"       或执行所有剩余: --step {' '.join(remaining)}")
 
         # 重新渲染 MD
         try:

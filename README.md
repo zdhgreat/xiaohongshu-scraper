@@ -99,33 +99,38 @@ python scripts/xhs.py export --format csv                # 全量 CSV（26 列�
 xiaohongshu_scraper_skill/
 ├── SKILL.md                   # 完整使用文档（给 AI Agent 用）
 ├── README.md                  # 本文件
+├── TECHNICAL_REPORT.md        # 完整技术报告
 ├── requirements.txt
 ├── docs/
-│   └── technical-report-image-analysis.md   # 图片分析技术报告
+│   └── technical-report-image-analysis.md   # 图片分析技术报告（已完成）
 ├── scripts/
 │   ├── xhs.py                 # CLI 入口 + 命令调度
-│   ├── xhs_config.py          # 统一配置 + 路径 + 共享工具
-│   ├── xhs_fetcher.py         # Fetcher 核心类 + 错误处理
-│   ├── xhs_api.py             # API 函数 + 数据标准化
-│   ├── xhs_media.py           # 媒体下载 + 后处理
-│   ├── xhs_storage.py         # SQLite + MD/CSV 渲染
-│   ├── xhs_sign.py            # 三档签名
-│   ├── xhs_login.py           # 三档登录 + 在线 cookie 验证
-│   ├── xhs_accounts.py        # 多账号管理
-│   ├── xhs_proxy.py           # 代理池
-│   ├── xhs_log.py             # 请求日志与统计
-│   ├── xhs_analyze.py         # 评论情感分析 & 话题聚类
-│   ├── xhs_update_js.py       # JS 签名资产自动更新
-│   ├── xhs_video.py           # 视频智能分析（语音转文字+OCR+AI摘要）
-│   ├── xhs_image.py           # 图片智能分析（OCR+AI视觉+Mermaid图表）
-│   └── xhs_bootstrap.py       # 首次运行自动安装依赖
+│   ├── xhs_config.py          # 统一配置 + 路径 + 共享工具 + 指纹池
+│   ├── xhs_fetcher.py         # Fetcher 核心类（TLS+节流+风控+浏览器接管）
+│   ├── xhs_api.py             # API 调用层 + 数据标准化
+│   ├── xhs_media.py           # 媒体下载 + 后处理编排
+│   ├── xhs_storage.py         # SQLite 存储 + Markdown/CSV 渲染
+│   ├── xhs_sign.py            # 三档签名引擎 + auto 路由
+│   ├── xhs_login.py           # 五档登录 fallback
+│   ├── xhs_login_native.py    # Windows/macOS 原生浏览器 Cookie 提取
+│   ├── xhs_login_wsl.py       # WSL 环境 CDP 桥接登录
+│   ├── xhs_accounts.py        # 多账号池（LRU 轮换 + 冷却 + 指纹绑定）
+│   ├── xhs_proxy.py           # 代理池（轮换 + 指数冷却）
+│   ├── xhs_log.py             # 结构化 JSONL 请求日志
+│   ├── xhs_analyze.py         # 评论情感分析 + 话题聚类
+│   ├── xhs_update_js.py       # 签名 JS 自动更新（从 GitHub）
+│   ├── xhs_video.py           # 视频分析（语音转写 + OCR + AI 摘要）
+│   ├── xhs_image.py           # 图片分析（OCR + AI 视觉 + Mermaid）
+│   └── xhs_bootstrap.py       # 依赖自动安装
 ├── assets/
 │   ├── xhs_main.js            # 签名核心（来自 cv-cat/Spider_XHS）
-│   ├── xhs_rap.js
-│   └── xhs_xray.js
+│   ├── xhs_rap.js             # x-rap-param 签名
+│   ├── xhs_xray.js            # x-xray-traceid 签名
+│   └── crypto-js.min.js       # CryptoJS（mini-racer 路径用）
 └── data/
     ├── xhs.db                 # SQLite
     ├── cookies.json           # 持久化 cookie
+    ├── accounts/              # 多账号 Cookie 存储
     ├── image_config.json      # 图片分析配置
     ├── video_config.json      # 视频分析配置
     ├── media/                 # 媒体文件：<博主名>/<笔记标题>/

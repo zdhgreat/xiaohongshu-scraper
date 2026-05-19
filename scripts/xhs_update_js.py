@@ -7,11 +7,13 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -40,6 +42,25 @@ def update_js(dry_run: bool = False) -> dict[str, str]:
             print(f"[UPDATE-JS] git clone 失败：{e.stderr[:200]}", file=sys.stderr)
             return {"error": f"git clone failed: {e.stderr[:100]}"}
 
+        # 捕获 git commit hash
+        commit_short = "unknown"
+        commit_full = ""
+        try:
+            r = subprocess.run(
+                ["git", "-C", tmp, "rev-parse", "--short", "HEAD"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if r.returncode == 0:
+                commit_short = r.stdout.strip()
+            r2 = subprocess.run(
+                ["git", "-C", tmp, "rev-parse", "HEAD"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if r2.returncode == 0:
+                commit_full = r2.stdout.strip()
+        except Exception:
+            pass
+
         static_dir = Path(tmp) / "static"
         if not static_dir.exists():
             print("[UPDATE-JS] 仓库中未找到 static/ 目录", file=sys.stderr)
@@ -55,7 +76,14 @@ def update_js(dry_run: bool = False) -> dict[str, str]:
                 results["xhs_main.js"] = "dry-run"
             else:
                 shutil.copy2(latest, dst)
-                print(f"[UPDATE-JS] {latest.name} → xhs_main.js", file=sys.stderr)
+                # 注入版本注释到 JS 文件头部
+                stamp = f"// xhs_main.js | source: {latest.name} | commit: {commit_short} | updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d')}\n"
+                original = dst.read_text(encoding="utf-8", errors="ignore")
+                # 移除旧的版本注释
+                if original.startswith("// xhs_main.js"):
+                    original = original.split("\n", 1)[-1]
+                dst.write_text(stamp + original, encoding="utf-8")
+                print(f"[UPDATE-JS] {latest.name} → xhs_main.js (commit {commit_short})", file=sys.stderr)
                 results["xhs_main.js"] = "updated"
         else:
             print("[UPDATE-JS] 未找到 xhs_main_*.js", file=sys.stderr)
@@ -82,6 +110,18 @@ def update_js(dry_run: bool = False) -> dict[str, str]:
             results["xhs_xray.js"] = "updated" if not dry_run else "dry-run"
         else:
             results["xhs_xray.js"] = "not_found"
+
+    # 记录版本信息到 data/js_version.json
+    if not dry_run and commit_short != "unknown":
+        version_path = ROOT / "data" / "js_version.json"
+        version_path.parent.mkdir(parents=True, exist_ok=True)
+        version_path.write_text(json.dumps({
+            "commit_short": commit_short,
+            "commit_full": commit_full,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "files": {k: v for k, v in results.items()},
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"[UPDATE-JS] 版本 {commit_short} 已记录到 data/js_version.json", file=sys.stderr)
 
     return results
 

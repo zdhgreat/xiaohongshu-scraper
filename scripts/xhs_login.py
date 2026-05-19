@@ -374,11 +374,11 @@ def acquire_cookies(prefer: str = "auto", headless_qr: bool = False, profile_hin
     }.get(prefer, ["win-edge", "win-chrome", "rookie", "wsl-edge-cdp", "wsl-edge", "wsl-chrome-cdp", "wsl-chrome", "qr", "manual"])
 
     # 非 WSL 环境自动跳过 WSL tier（避免无意义的错误输出）
-    platform = _current_platform()
-    if platform != "wsl":
+    _plat = _current_platform()
+    if _plat != "wsl":
         chain = [t for t in chain if t not in _WSL_TIERS]
     # WSL 环境跳过 native browser tier（WSL 无本地 Edge/Chrome）
-    if platform == "wsl":
+    if _plat == "wsl":
         chain = [t for t in chain if t not in _WIN_TIERS]
 
     last_err: Exception | None = None

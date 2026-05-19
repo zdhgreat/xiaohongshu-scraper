@@ -86,5 +86,12 @@ class ProxyPool:
         # 全部冷却中
         return None
 
+    def get_bound(self, url: str) -> Proxy | None:
+        """查找绑定到指定 URL 的代理。"""
+        for p in self.proxies:
+            if p.url == url:
+                return p if p.is_available() else None
+        return None
+
     def __len__(self) -> int:
         return len(self.proxies)

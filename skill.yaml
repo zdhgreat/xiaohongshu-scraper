@@ -1,6 +1,6 @@
 name: xiaohongshu-scraper
 description: 抓取小红书笔记、用户主页、关键词搜索结果，落库 SQLite 并导出 Markdown / CSV（飞书多维表格格式）
-version: "0.1.0"
+version: "1.5.0"
 author: zhudonghai
 type: skill
 entrypoint: scripts/xhs.py

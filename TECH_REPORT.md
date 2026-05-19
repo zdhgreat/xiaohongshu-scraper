@@ -2,6 +2,8 @@
 
 > 基于桌面设计报告《小红书爬虫项目方案书》(v1.0, 2025-05-17) 与实际代码的差异分析，
 > 记录方向变更、完成度评估及后续待办。
+>
+> **注意**：本文件记录设计文档与实现的对比。完整技术文档请参阅 [TECHNICAL_REPORT.md](TECHNICAL_REPORT.md)。
 
 ---
 
@@ -10,9 +12,9 @@
 | 项目 | 内容 |
 |------|------|
 | 仓库路径 | `~/workspace/xiaohongshu_scraper_skill` |
-| 代码规模 | ~4,500 行 Python + 4 个 JS 签名资产 |
-| 当前版本 | 0.2.0 |
-| 完成阶段 | P1 MVP + P1.5 反风控 + P2 强化 + P3 扩展（全部闭合） |
+| 代码规模 | ~5,200 行 Python（18 个模块） + 4 个 JS 签名资产 |
+| 当前版本 | v1.5 |
+| 完成阶段 | P1 MVP + P1.5 反风控 + P2 强化 + P3 扩展 + P4 视频 + P5 图片（全部闭合） |
 | 未启动阶段 | 无 |
 
 ---
@@ -30,7 +32,7 @@
 ### 2.2 实际实现方向
 
 - **技术路线**：`curl_cffi` Chrome TLS 模拟为主 + Playwright 浏览器接管为 fallback，**未采用 DrissionPage**
-- **架构结果**：多文件拆分（8 个 Python 模块），主文件 `xhs.py` 1,316 行
+- **架构结果**：多文件拆分（18 个 Python 模块），主文件 `xhs.py` 940 行
 - **数据库**：5 张表（users / notes / comments / search_cache / crawl_state），**images/videos 独立表被砍**，改为从 `raw_json` 中按需提取
 - **登录方式**：新增 WSL Edge CDP 桥接（`xhs_login_wsl.py`），支持 Windows 宿主浏览器透传；保留 rookiepy/QR/manual 三档
 - **签名维护**：改为 **三档签名可降级**（PlaywrightSigner / EmbedJsSigner / PyPortSigner），EmbedJs 基于社区 `cv-cat/Spider_XHS` 的 JS 资产，月度替换文件即可，**无需维护算法本身**
@@ -51,7 +53,7 @@
 | `login`（rookiepy 提取） | ✅ 规划 | ✅ 完成 | — |
 | `login --qr`（QR 扫码） | ✅ 规划 | ✅ 完成 | Playwright 实现 |
 | `login --manual`（手动粘贴） | ✅ 规划 | ✅ 完成 | — |
-| `token`（查看/刷新/验证） | ✅ 规划 | ❌ **未实现** | 合并到 `login` 流程，无独立子命令 |
+| `token`（查看/刷新/验证） | ✅ 规划 | ✅ 完成 | `refresh-cookies` 子命令，含在线验证 + 自动重登 |
 | `sign-test`（签名健康检查） | — | ✅ 完成 | 新增，实际必要 |
 | `note`（单笔记详情） | ✅ 规划 | ✅ 完成 | — |
 | `user`（用户主页+笔记列表） | ✅ 规划 | ✅ 完成 | — |
@@ -65,8 +67,6 @@
 | `stats`（请求统计） | — | ✅ 完成 | P2 新增 |
 | `feed`（推荐流/分类流） | ✅ 规划 | ✅ 完成 | 6 个分类 + crawl-feed 断点续抓 |
 | `token`（查看/刷新/验证） | ✅ 规划 | ✅ 完成 | `refresh-cookies` 子命令，含在线验证 + 自动重登 |
-| `accounts`（多账号状态查看） | — | ✅ 完成 | P2 新增 |
-| `stats`（请求统计） | — | ✅ 完成 | P2 新增 |
 | `analyze`（情感分析/话题聚类） | — | ✅ 完成 | P3 新增，SnowNLP + jieba，缺失时降级 |
 | `update-js`（签名 JS 自动更新） | — | ✅ 完成 | P3 新增，从 Spider_XHS 拉取 |
 | 代理池支持 | — | ✅ 完成 | P2 新增 |
@@ -105,18 +105,15 @@ xiaohongshu_scraper_skill/
 xiaohongshu_scraper_skill/
 ├── SKILL.md                 # Agent 平台读取的 Skill 配置
 ├── README.md                # 快速开始文档
-├── TECH_REPORT.md           # ← 本文件
+├── TECHNICAL_REPORT.md      # 完整技术报告
+├── TECH_REPORT.md           # ← 本文件（设计对比）
 ├── requirements.txt         # Python 依赖
-├── skill.yaml               # Skill 元数据
-├── _meta.json               # 发布元数据
 ├── .gitignore
 ├── assets/                  # 签名 JS 资产
 │   ├── xhs_main.js          # 签名核心（cv-cat/Spider_XHS）
 │   ├── xhs_rap.js           # x-rap-param JSVMP
 │   ├── xhs_xray.js          # x-xray-traceid
-│   ├── xhs_a1.js            # a1 算法
-│   ├── crypto-js.min.js     # JS 引擎依赖
-│   └── node_modules/        # npm 依赖
+│   └── crypto-js.min.js     # JS 引擎依赖
 ├── data/                    # 运行时数据（gitignore）
 │   ├── xhs.db               # SQLite
 │   ├── cookies.json         # 持久化 cookie
@@ -125,16 +122,24 @@ xiaohongshu_scraper_skill/
 │   ├── media/               # 下载的媒体文件
 │   └── pw_profile/          # Playwright 浏览器 profile
 └── scripts/
-    ├── xhs.py               # CLI 入口 + Fetcher + API 层（~1,600 行）
-    ├── xhs_sign.py          # 三档签名 + 降级路由（430 行）
-    ├── xhs_login.py         # 三档登录 + 在线 cookie 验证（340 行）
-    ├── xhs_login_wsl.py     # WSL Edge CDP 桥接（447 行）
-    ├── xhs_storage.py       # SQLite + MD/CSV 渲染（430 行）
-    ├── xhs_accounts.py      # 多账号管理与状态追踪（202 行）
-    ├── xhs_proxy.py         # 代理池（90 行）
-    ├── xhs_log.py           # 请求日志与统计（152 行）
-    ├── xhs_analyze.py       # 评论情感分析 & 话题聚类（250 行）
-    └── xhs_update_js.py     # JS 签名资产自动更新（90 行）
+    ├── xhs.py               # CLI 入口 + 命令调度（~940 行）
+    ├── xhs_config.py        # 统一配置 + 路径 + 指纹池
+    ├── xhs_fetcher.py       # HTTP 核心层（TLS+节流+风控+浏览器接管）
+    ├── xhs_api.py           # API 调用层 + 数据标准化
+    ├── xhs_media.py         # 媒体下载 + 后处理编排
+    ├── xhs_sign.py          # 三档签名引擎 + auto 路由
+    ├── xhs_login.py         # 五档登录 fallback
+    ├── xhs_login_native.py  # Windows/macOS 原生浏览器 Cookie 提取
+    ├── xhs_login_wsl.py     # WSL 环境 CDP 桥接登录
+    ├── xhs_storage.py       # SQLite 存储 + Markdown/CSV 渲染
+    ├── xhs_accounts.py      # 多账号池（LRU 轮换 + 冷却 + 指纹绑定）
+    ├── xhs_proxy.py         # 代理池（轮换 + 指数冷却）
+    ├── xhs_log.py           # 结构化 JSONL 请求日志
+    ├── xhs_analyze.py       # 评论情感分析 + 话题聚类
+    ├── xhs_update_js.py     # 签名 JS 自动更新（从 GitHub）
+    ├── xhs_video.py         # 视频分析（语音转写 + OCR + AI 摘要）
+    ├── xhs_image.py         # 图片分析（OCR + AI 视觉 + Mermaid）
+    └── xhs_bootstrap.py     # 依赖自动安装
 ```
 
 ### 4.2 反风控架构差异
@@ -218,7 +223,7 @@ xiaohongshu_scraper_skill/
 - skill.yaml
 - _meta.json
 - .gitignore
-- scripts/（8 个 Python 模块）
+- scripts/（18 个 Python 模块）
 - assets/（4 个 JS 签名文件 + node_modules/）
 - data/（运行时生成，打包时排除）
 
@@ -230,5 +235,6 @@ xiaohongshu_scraper_skill/
 
 ---
 
-*报告更新时间：2026-05-18*
-*P3 扩展阶段已全部闭合，所有规划功能已完成*
+*报告更新时间：2026-05-19*
+*P5 扩展阶段已全部闭合，所有规划功能已完成*
+*完整技术文档请参阅 TECHNICAL_REPORT.md*

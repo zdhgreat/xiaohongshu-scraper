@@ -31,6 +31,7 @@ XHS_MAIN_JS = ASSETS / "xhs_main.js"
 XHS_RAP_JS = ASSETS / "xhs_rap.js"
 XHS_XRAY_JS = ASSETS / "xhs_xray.js"
 CRYPTO_JS = ASSETS / "crypto-js.min.js"
+JS_VERSION_PATH = ROOT / "data" / "js_version.json"
 
 # 给 bare V8（py_mini_racer）一个最小 Node 兼容层：window / global / globalThis / require("crypto-js")
 # crypto-js.min.js 是 UMD，会把 CryptoJS 挂到 this 上；xhs_main.js 的"补环境"代码也依赖 global。
@@ -55,17 +56,51 @@ def random_b3_traceid(n: int = 16) -> str:
     return "".join(random.choice("abcdef0123456789") for _ in range(n))
 
 
+def _load_js_version() -> dict:
+    """读取签名 JS 版本信息。优先从 js_version.json，fallback 到 JS 文件头部注释。"""
+    if JS_VERSION_PATH.exists():
+        try:
+            return json.loads(JS_VERSION_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    # fallback: 从 JS 文件头部注释提取 commit
+    import re
+    try:
+        head = XHS_MAIN_JS.read_text(encoding="utf-8", errors="ignore")[:200]
+        m = re.search(r"commit:\s*(\S+)", head)
+        if m:
+            return {"commit_short": m.group(1).rstrip(",")}
+        # 没有注释时，用文件修改时间
+        from datetime import datetime, timezone
+        mtime = XHS_MAIN_JS.stat().st_mtime
+        return {"commit_short": f"file-{datetime.fromtimestamp(mtime, tz=timezone.utc).strftime('%Y%m%d')}",
+                "updated_at": datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()}
+    except Exception:
+        return {}
+
+
+def _js_version_suffix() -> str:
+    """构建版本后缀字符串，用于日志和警告。"""
+    ver = _load_js_version()
+    short = ver.get("commit_short", "")
+    if short:
+        updated = ver.get("updated_at", "")[:10]
+        return f" (JS 版本: {short}, 更新于 {updated})"
+    return " (JS 版本: 未知, 请运行 update-js)"
+
+
 def check_js_staleness(warn_days: int = 30, critical_days: int = 60) -> str | None:
     """检查签名 JS 文件是否过期。返回警告消息或 None。"""
     if not XHS_MAIN_JS.exists():
         return None
     age_days = (time.time() - XHS_MAIN_JS.stat().st_mtime) / 86400
+    ver_suffix = _js_version_suffix()
     if age_days > critical_days:
         return (f"[WARN] 签名 JS 已 {int(age_days)} 天未更新（>{critical_days}天），"
-                f"签名大概率失效！建议: python scripts/xhs.py update-js")
+                f"签名大概率失效！建议: python scripts/xhs.py update-js{ver_suffix}")
     if age_days > warn_days:
         return (f"[WARN] 签名 JS 已 {int(age_days)} 天未更新（>{warn_days}天），"
-                f"建议: python scripts/xhs.py update-js")
+                f"建议: python scripts/xhs.py update-js{ver_suffix}")
     return None
 
 
@@ -118,17 +153,12 @@ class _JsCtx:
             self._ctx.eval(source)
         elif engine == "execjs":
             import execjs  # type: ignore
-            # cwd 控制 require('crypto-js') 能否找到 node_modules
+            # 将 cwd 绝对路径注入 source，让 require() 用绝对路径解析 node_modules
             if cwd:
                 import os
-                old = os.getcwd()
-                os.chdir(cwd)
-                try:
-                    self._ctx = execjs.compile(source)
-                finally:
-                    os.chdir(old)
-            else:
-                self._ctx = execjs.compile(source)
+                cwd_abs = str(cwd).replace("\\", "/")
+                source = f"process.chdir('{cwd_abs}');\n{source}"
+            self._ctx = execjs.compile(source)
         else:
             raise SignError(f"unknown js engine {engine}")
 
@@ -179,6 +209,8 @@ class EmbedJsSigner(SignerBase):
         _msg = check_js_staleness()
         if _msg:
             print(_msg, file=sys.stderr)
+        ver = _load_js_version()
+        print(f"[SIGN] JS 版本: {ver.get('commit_short', '未知')}", file=sys.stderr)
         self._engine = _pick_engine()
         self._ctx_main: _JsCtx | None = None
         self._ctx_rap: _JsCtx | None = None
@@ -225,7 +257,8 @@ class EmbedJsSigner(SignerBase):
 
     def sign(self, api: str, data: Any, a1: str, method: str = "POST") -> dict[str, str]:
         self._reload_if_stale()
-        assert self._ctx_main is not None
+        if self._ctx_main is None:
+            raise SignError("EmbedJsSigner 上下文未初始化")
         data_str = "" if not data else (data if isinstance(data, str) else json.dumps(data, separators=(",", ":"), ensure_ascii=False))
         try:
             ret = self._ctx_main.call("get_request_headers_params", api, data_str, a1, method)
@@ -297,7 +330,8 @@ class PlaywrightSigner(SignerBase):
 
     def sign(self, api: str, data: Any, a1: str, method: str = "POST") -> dict[str, str]:
         self._ensure_browser()
-        assert self._page is not None
+        if self._page is None:
+            raise SignError("PlaywrightSigner 页面未初始化")
         data_str = "" if not data else (data if isinstance(data, str) else json.dumps(data, separators=(",", ":"), ensure_ascii=False))
         ts = int(time.time() * 1000)
         try:

@@ -97,6 +97,8 @@ class FingerprintProfile:
     sec_ch_ua: str
     impersonate: str
     accept_language: str
+    timezone: str = "Asia/Shanghai"
+    region: str = "CN"
 
 FINGERPRINT_POOL: list[FingerprintProfile] = [
     # 0: Edge 131 / Windows

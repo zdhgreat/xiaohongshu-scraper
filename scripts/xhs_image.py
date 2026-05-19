@@ -653,15 +653,21 @@ def analyze_images(
     note_id: str,
     conn,
     cfg: dict[str, Any] | None = None,
+    steps: list[str] | None = None,
 ) -> dict[str, Any]:
     """分析图文笔记的图片内容。
 
-    返回 {"ocr_text": str, "image_summary": str, "mermaid": str, "image_count": int}
+    steps: 控制执行哪些阶段，None 表示全部执行。
+           ["ocr"]      → 仅 OCR
+           ["vision"]   → 仅 AI 视觉（需先 OCR，用缓存）
+           ["mermaid"]  → 仅 Mermaid（需先 vision，用缓存）
+           支持任意组合，如 ["ocr", "vision"]
     """
     import xhs_storage
     import xhs_media
 
     cfg = cfg or load_config()
+    all_steps = steps is None
 
     row = xhs_storage.get_note(conn, note_id)
     title = row["title"] if row else ""
@@ -673,6 +679,25 @@ def analyze_images(
         "mermaid": "",
         "image_count": 0,
     }
+
+    # 缓存目录
+    cache_dir = _image_cache_dir(note_id, conn)
+    ocr_cache = cache_dir / "ocr.json"
+    vision_cache = cache_dir / "vision.json"
+
+    # 加载已有缓存
+    if ocr_cache.exists():
+        try:
+            result["ocr_text"] = ocr_cache.read_text(encoding="utf-8")
+        except Exception:
+            pass
+    if vision_cache.exists():
+        try:
+            d = json.loads(vision_cache.read_text(encoding="utf-8"))
+            result["image_summary"] = d.get("summary", "")
+            result["mermaid"] = d.get("mermaid", "")
+        except Exception:
+            pass
 
     # 1. 查找本地图片
     image_paths = find_local_images(note_id, conn)
@@ -692,27 +717,61 @@ def analyze_images(
     result["image_count"] = len(image_paths)
     _msg(f"找到 {len(image_paths)} 张图片")
 
-    # 2. Layer 1: OCR（始终执行）
-    _msg("OCR 识别中...")
-    ocr_text = _do_ocr(image_paths)
-    result["ocr_text"] = ocr_text
-    if ocr_text:
-        _msg(f"OCR 完成: {len(ocr_text)} 字")
+    # 2. Layer 1: OCR
+    if all_steps or "ocr" in steps:
+        _msg("OCR 识别中...")
+        ocr_text = _do_ocr(image_paths)
+        result["ocr_text"] = ocr_text
+        # 缓存 OCR 结果
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        ocr_cache.write_text(ocr_text, encoding="utf-8")
+        if ocr_text:
+            _msg(f"OCR 完成: {len(ocr_text)} 字（已缓存）")
+        else:
+            _msg("OCR 未识别到文字")
     else:
-        _msg("OCR 未识别到文字")
+        # 使用缓存的 OCR
+        ocr_text = result["ocr_text"]
+        if ocr_text:
+            _msg(f"使用缓存 OCR: {len(ocr_text)} 字")
+        else:
+            _msg("无 OCR 缓存，需先执行 ocr 步骤")
 
-    # 3. Layer 2: 分析
-    mode = cfg.get("image_mode", "auto")
-    used_vision = False  # 追踪是否实际调用了视觉后端
+    # 3. Layer 2: AI 视觉 / 本地分析
+    if all_steps or "vision" in steps:
+        mode = cfg.get("image_mode", "auto")
+        used_vision = False
 
-    if mode == "auto":
-        # 自动判断：根据 OCR 结果决定是否需要 AI 视觉
-        has_ai = _check_ai_backend_available(cfg)
-        need_vision, reason = _should_use_vision(
-            ocr_text, title, desc, len(image_paths), has_ai
-        )
-        _msg(f"auto 判断: {'需要 AI 视觉' if need_vision else 'OCR 足够'}（{reason}）")
-        if need_vision and has_ai:
+        if mode == "auto":
+            has_ai = _check_ai_backend_available(cfg)
+            need_vision, reason = _should_use_vision(
+                ocr_text, title, desc, len(image_paths), has_ai
+            )
+            _msg(f"auto 判断: {'需要 AI 视觉' if need_vision else 'OCR 足够'}（{reason}）")
+            if need_vision and has_ai:
+                _msg("AI 视觉分析中...")
+                try:
+                    result["image_summary"] = _vision_analyze(
+                        image_paths, ocr_text, title, desc, cfg
+                    )
+                    used_vision = True
+                    _msg("AI 视觉分析完成")
+                except Exception as e:
+                    _msg(f"AI 视觉分析失败，降级到 local: {e}")
+                    result["image_summary"] = _analyze_local(ocr_text, title, desc)
+            elif need_vision and not has_ai:
+                _msg("需要 AI 视觉但无可用后端，降级到 local")
+                result["image_summary"] = _analyze_local(ocr_text, title, desc)
+            else:
+                _msg("OCR 内容充足，跳过 AI 分析")
+
+        elif mode == "none":
+            _msg("image_mode=none，跳过 AI 分析")
+        elif mode == "local":
+            _msg("本地文本分析中...")
+            result["image_summary"] = _analyze_local(ocr_text, title, desc)
+            _msg("本地分析完成")
+        elif mode == "vision":
             _msg("AI 视觉分析中...")
             try:
                 result["image_summary"] = _vision_analyze(
@@ -723,41 +782,49 @@ def analyze_images(
             except Exception as e:
                 _msg(f"AI 视觉分析失败，降级到 local: {e}")
                 result["image_summary"] = _analyze_local(ocr_text, title, desc)
-        elif need_vision and not has_ai:
-            _msg("需要 AI 视觉但无可用后端，降级到 local")
-            result["image_summary"] = _analyze_local(ocr_text, title, desc)
-        else:
-            _msg("OCR 内容充足，跳过 AI 分析")
 
-    elif mode == "none":
-        _msg("image_mode=none，跳过 AI 分析")
-    elif mode == "local":
-        _msg("本地文本分析中...")
-        result["image_summary"] = _analyze_local(ocr_text, title, desc)
-        _msg("本地分析完成")
-    elif mode == "vision":
-        _msg("AI 视觉分析中...")
+        # 缓存视觉结果
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        vision_cache.write_text(json.dumps({
+            "summary": result["image_summary"],
+            "mermaid": "",
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+        _msg("视觉分析已缓存")
+
+    # 4. Layer 3: Mermaid
+    if all_steps or "mermaid" in steps:
+        if result["image_summary"]:
+            _msg("Mermaid 图表生成中...")
+            mermaid = _generate_mermaid(result["image_summary"], cfg)
+            if mermaid:
+                result["mermaid"] = mermaid
+                _msg("Mermaid 图表已生成")
+                # 更新缓存
+                vision_cache.write_text(json.dumps({
+                    "summary": result["image_summary"],
+                    "mermaid": mermaid,
+                }, ensure_ascii=False, indent=2), encoding="utf-8")
+            else:
+                _msg("未检测到路线/流程类内容，不生成图表")
+        else:
+            _msg("无视觉分析结果，跳过 Mermaid")
+
+    # 清理缓存（仅在完整执行时）
+    if all_steps and cache_dir.exists():
         try:
-            result["image_summary"] = _vision_analyze(
-                image_paths, ocr_text, title, desc, cfg
-            )
-            used_vision = True
-            _msg("AI 视觉分析完成")
-        except Exception as e:
-            _msg(f"AI 视觉分析失败，降级到 local: {e}")
-            result["image_summary"] = _analyze_local(ocr_text, title, desc)
-
-    # 4. Layer 3: Mermaid（仅实际使用了视觉后端时才生成）
-    if cfg.get("image_mermaid", False) and used_vision and result["image_summary"]:
-        _msg("Mermaid 图表生成中...")
-        mermaid = _generate_mermaid(result["image_summary"], cfg)
-        if mermaid:
-            result["mermaid"] = mermaid
-            _msg("Mermaid 图表已生成")
-        else:
-            _msg("未检测到路线/流程类内容，不生成图表")
+            import shutil
+            shutil.rmtree(cache_dir, ignore_errors=True)
+        except Exception:
+            pass
 
     return result
+
+
+def _image_cache_dir(note_id: str, conn) -> Path:
+    """获取图片分析缓存目录。"""
+    import xhs_storage
+    media_dir = xhs_storage._find_media_dir(note_id, conn)
+    return media_dir / "_cache"
 
 
 # ---------------------------------------------------------------------------
@@ -820,9 +887,20 @@ def cmd_analyze_images(args) -> int:
             elif backend == "mcp":
                 print("[INFO] 使用 MCP 视觉后端（由 AI Agent 提供，零配置）")
 
+        # 解析 --step 参数
+        steps = None
+        if hasattr(args, "step") and args.step is not None:
+            valid_steps = {"ocr", "vision", "mermaid"}
+            steps = [s for s in args.step if s in valid_steps]
+            if not steps:
+                print(f"[WARN] --step 无有效值，执行全部阶段", file=sys.stderr)
+                steps = None
+            else:
+                print(f"[IMAGE] 分段模式: {' → '.join(steps)}", file=sys.stderr)
+
         # 执行分析
         print(f"[IMAGE] 开始分析《{title}》...", file=sys.stderr)
-        result = analyze_images(args.note_id, conn, cfg)
+        result = analyze_images(args.note_id, conn, cfg, steps=steps)
 
         # 将结果存入 DB
         xhs_storage.update_image_analysis(
@@ -834,7 +912,11 @@ def cmd_analyze_images(args) -> int:
         )
 
         # 打印更新内容摘要
-        print(f"\n[OK] 《{title}》图片分析完成，已更新以下内容:")
+        is_partial = steps is not None
+        if is_partial:
+            print(f"\n[OK] 《{title}》分段完成 ({' → '.join(steps)})")
+        else:
+            print(f"\n[OK] 《{title}》图片分析完成:")
         updates = []
         ocr_text = result.get("ocr_text", "")
         if ocr_text:
@@ -854,6 +936,17 @@ def cmd_analyze_images(args) -> int:
             print("     (无新内容)")
         else:
             print(f"     更新项: {'、'.join(updates)}")
+
+        # 分段模式提示下一步
+        if is_partial:
+            all_stages = ["ocr", "vision", "mermaid"]
+            done = set(steps)
+            remaining = [s for s in all_stages if s not in done]
+            if remaining:
+                next_step = remaining[0]
+                print(f"\n[NEXT] 下一步: python scripts/xhs.py analyze-images {args.note_id} --step {next_step}")
+                if len(remaining) > 1:
+                    print(f"       或执行所有剩余: --step {' '.join(remaining)}")
 
         # 重新渲染 MD
         try:

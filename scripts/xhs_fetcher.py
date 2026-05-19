@@ -76,6 +76,12 @@ class Fetcher:
         else:
             self.session = _HttpSession()
         self._apply_proxy()
+        # 如果账号有绑定代理，优先使用
+        if self.account.proxy_url and proxy_pool:
+            bound = proxy_pool.get_bound(self.account.proxy_url)
+            if bound:
+                self.current_proxy = bound
+                self._apply_proxy()
         self.session.headers.update(xhs_config.base_headers())
         self.session.cookies.update(self.cookies)
         self._apply_fingerprint()
@@ -87,6 +93,7 @@ class Fetcher:
         self._ip_timestamps: dict[str, deque] = {}
         self._ip_rate_limit = xhs_config.IP_RATE_LIMIT
         self._ip_rate_window = xhs_config.IP_RATE_WINDOW
+        self._last_geo_check: float = 0.0
         self.browser_takeover: PlaywrightTakeover | None = None
         self._warmed = False
         self._relogin_count = 0
@@ -131,6 +138,14 @@ class Fetcher:
         self.session.cookies.clear()
         self.session.cookies.update(self.cookies)
         self._apply_fingerprint()
+        # 如果新账号有绑定代理，切换到对应代理
+        if new_acc.proxy_url and self.proxy_pool:
+            bound = self.proxy_pool.get_bound(new_acc.proxy_url)
+            if bound:
+                self.current_proxy = bound
+                self._apply_proxy()
+                print(f"[FETCH] 切换到绑定代理 {bound.label} (account={new_acc.alias})",
+                      file=sys.stderr)
         return True
 
     def _rotate_proxy(self, reason: str) -> bool:
@@ -145,7 +160,33 @@ class Fetcher:
             print(f"[FETCH] 切换代理 {old} → {new_p.label}（{reason}）", file=sys.stderr)
             self.current_proxy = new_p
         self._apply_proxy()
+        self._check_proxy_geo()
         return True
+
+    def _check_proxy_geo(self) -> None:
+        """检查代理 IP 归属地与当前指纹 region 是否矛盾（每小时最多一次）。"""
+        if not self.current_proxy:
+            return
+        now = time.time()
+        if now - self._last_geo_check < 3600:
+            return
+        self._last_geo_check = now
+        fp = getattr(self.account, 'fingerprint', None)
+        expected_region = fp.region if fp else "CN"
+        try:
+            import requests as _req
+            resp = _req.get(
+                "http://ip-api.com/json/?fields=countryCode",
+                proxies={"http": self.current_proxy.url, "https": self.current_proxy.url},
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                country = resp.json().get("countryCode", "")
+                if country and country != expected_region:
+                    print(f"[GEO-WARN] 代理 IP 在 {country}，但指纹区域是 {expected_region}。"
+                          f"可能触发风控检测。", file=sys.stderr)
+        except Exception:
+            pass  # 网络错误不阻塞
 
     # -----------------------------------------------------------------
     # Warmup：模仿真人 — 打开首页 → 等几秒 → 才开始抓
@@ -283,17 +324,31 @@ class Fetcher:
                 )
         except Exception as e:
             duration = int((time.time() - t0) * 1000)
-            print(f"[FETCH] 网络异常：{e}", file=sys.stderr)
+            print(f"[FETCH] 网络异常：{e}（将重试 1 次）", file=sys.stderr)
             xhs_log.log_request(api, method, 0, None, str(e)[:80], duration,
                                  sign_mode=self._sign_mode_label,
                                  speed_mode=self._speed_mode_label,
                                  account=self.account.alias, proxy=proxy_label)
-            # 网络异常可能是代理问题
+            # 网络异常可能是代理问题，切换代理后重试一次
             if self.current_proxy:
                 self.current_proxy.mark_failure()
                 self._rotate_proxy("网络异常")
             time.sleep(10)
-            raise
+            # 单次重试
+            try:
+                proxy_url, proxy_label = self._resolve_proxy()
+                if method == "GET":
+                    resp = self.session.get(url, headers=headers, timeout=20)
+                else:
+                    resp = self.session.post(
+                        url,
+                        headers=headers,
+                        data=json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode("utf-8"),
+                        timeout=20,
+                    )
+            except Exception as e2:
+                print(f"[FETCH] 重试仍然失败：{e2}", file=sys.stderr)
+                raise e2 from e
 
         duration = int((time.time() - t0) * 1000)
         if count:
@@ -388,14 +443,14 @@ class Fetcher:
                 self.account_mgr.save_state()
                 if self._rotate_account("连续 460"):
                     self.consecutive_460 = 0
-                    return self._call(method, api, params, data)
+                    return self._call_raw(method, api, params, data, count=False, _retry_depth=_retry_depth + 1)
                 # 单账号：提示用户等待而非静默浏览器接管
                 raise FatalRiskError(
                     f"单账号 {self.account.alias} 触发连续 460，已冷却 30 分钟。"
                     "请等待冷却结束后重试，或添加更多账号（login --name <alias>）"
                 )
             time.sleep(random.uniform(60, 120))
-            return self._call(method, api, params, data)
+            return self._call_raw(method, api, params, data, count=False, _retry_depth=_retry_depth + 1)
 
         if status == 461:
             print("[FETCH] 461 验证码", file=sys.stderr)
@@ -403,7 +458,7 @@ class Fetcher:
             self.account_mgr.save_state()
             # 先尝试切账号
             if self._rotate_account("461 验证码"):
-                return self._call(method, api, params, data)
+                return self._call_raw(method, api, params, data, count=False, _retry_depth=_retry_depth + 1)
             # 否则切浏览器接管
             return self._browser_fetch(method, api, params, data)
 

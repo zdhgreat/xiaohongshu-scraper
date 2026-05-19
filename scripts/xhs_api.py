@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 import random
 import time
@@ -149,6 +150,18 @@ def _make_search_id() -> str:
 # 数据标准化（纯函数）
 # ---------------------------------------------------------------------------
 
+def _compute_content_hash(note: dict) -> str:
+    """计算笔记关键字段的轻量 hash，用于增量更新检测。"""
+    payload = "|".join(str(v) for v in [
+        note.get("title", ""),
+        note.get("description", ""),
+        note.get("liked_count", 0),
+        note.get("collected_count", 0),
+        note.get("comment_count", 0),
+    ])
+    return hashlib.md5(payload.encode("utf-8")).hexdigest()
+
+
 def _normalize_note(item: dict) -> dict:
     note = item.get("note_card") or item
     user = note.get("user") or {}
@@ -156,12 +169,22 @@ def _normalize_note(item: dict) -> dict:
     # xsec_token 可能在 item 顶层（search 返回）或 note_card 内
     xsec_token = item.get("xsec_token") or note.get("xsec_token", "")
     xsec_source = item.get("xsec_source") or note.get("xsec_source", "")
-    return {
+
+    # 提前提取 video_url 用于 type 兜底
+    video_url = xhs_storage._extract_video_url(note) or ""
+
+    # type 判定：优先用 API 返回值，兜底用 video 字段存在性
+    note_type = note.get("type", "")
+    if not note_type or note_type not in ("video", "normal", "note"):
+        # API 未返回 type 或值异常 → 通过 video 字段推断
+        note_type = "video" if (video_url or note.get("video")) else "note"
+
+    ret = {
         "note_id": item.get("id") or note.get("note_id") or note.get("id"),
         "user_id": user.get("user_id") or user.get("userid", ""),
         "title": note.get("title") or note.get("display_title", ""),
         "description": note.get("desc", ""),
-        "type": note.get("type", "note"),
+        "type": note_type,
         "liked_count": _to_int(interact.get("liked_count")),
         "collected_count": _to_int(interact.get("collected_count")),
         "comment_count": _to_int(interact.get("comment_count")),
@@ -171,11 +194,13 @@ def _normalize_note(item: dict) -> dict:
         "published_at": _ts_to_str(note.get("time") or note.get("last_update_time")),
         "xsec_token": xsec_token,
         "xsec_source": xsec_source,
-        "video_url": xhs_storage._extract_video_url(note) or "",
+        "video_url": video_url,
         "cover_url": xhs_storage._extract_cover_url(note) or "",
         "video_duration": xhs_storage._extract_video_duration(note),
         "raw": note,
     }
+    ret["content_hash"] = _compute_content_hash(ret)
+    return ret
 
 
 def _normalize_user(info: dict) -> dict:
@@ -235,10 +260,10 @@ def _ts_to_str(ts: Any) -> str:
     if not ts:
         return ""
     try:
-        from datetime import datetime
+        from datetime import datetime, timezone
         ts = int(ts)
         if ts > 1e12:
             ts //= 1000
-        return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+        return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
         return str(ts)

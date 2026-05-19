@@ -1,6 +1,9 @@
 # 技术报告：图片智能分析功能设计
 
-> 版本：v1.0 | 日期：2026-05-18 | 状态：设计中
+> 版本：v1.0 | 日期：2026-05-18 | 状态：✅ 已完成（P5 阶段已闭合）
+>
+> 实现文件：`scripts/xhs_image.py` | CLI 命令：`analyze-images` / `setup-image`
+> 完成日期：2026-05-19 | 详细文档：[TECHNICAL_REPORT.md](../TECHNICAL_REPORT.md) 第五节
 
 ---
 

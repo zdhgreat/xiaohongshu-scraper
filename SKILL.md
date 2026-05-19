@@ -1,7 +1,7 @@
 ---
 name: xiaohongshu-scraper
 description: 抓取小红书（RedNote/Little Red Book/XHS）笔记、用户主页、关键词搜索结果，落库 SQLite 并导出 Markdown / CSV（飞书多维表格格式）。在用户提到"爬小红书"、"采集小红书笔记"、"抓 xhs"、"分析小红书数据"、"导出小红书到飞书"、"备份我喜欢的小红书博主"、"收集某关键词下的小红书内容"等场景时调用。三档签名（playwright/embed-js/py-port）+ 三档登录（rookiepy/QR/手动）+ 浏览器接管 的纵深防御架构，应对小红书强反爬。
-version: "0.1.0"
+version: "1.5.0"
 author: zhudonghai
 type: skill
 tags:
@@ -82,7 +82,7 @@ python scripts/xhs.py setup
 #   Linux:   sudo apt install ffmpeg
 ```
 
-> 如果不需要视频分析，可以不装 ffmpeg，其他功能不受影响。
+> 未安装 ffmpeg 时，视频分析会降级为仅 OCR，但 analyze-video 步骤仍需执行。
 
 **配置图片/视频分析**（安装完依赖后运行）：
 
@@ -198,8 +198,8 @@ python scripts/xhs.py accounts
 | 用户意图 | 命令 | 说明 |
 |---|---|---|
 | 抓单条笔记 | `python scripts/xhs.py note <note_id> [--xsec-token <token>]` | 部分笔记需 xsec_token（从分享链接 URL 参数取）；DB 里有时自动复用 |
-| 抓某用户笔记列表 | `python scripts/xhs.py user <user_id> --pages 3` | 前 N 页，每页 30 条 |
-| 抓关键词搜索 | `python scripts/xhs.py search "<关键词>" --pages 2` | 前 N 页，每页 20 条 |
+| 抓某用户笔记列表 | `python scripts/xhs.py user <user_id> --pages 3 --download --analyze` | 前 N 页，每页 30 条；加 `--download --analyze` 自动下载+分析 |
+| 抓关键词搜索 | `python scripts/xhs.py search "<关键词>" --pages 2 --download --analyze` | 前 N 页，每页 20 条；加 `--download --analyze` 自动下载+分析 |
 | 抓某笔记评论 | `python scripts/xhs.py comments <note_id> --max-pages 5 --max-sub-pages 3 [--no-sub]` | 含子评论分页；`--no-sub` 跳过子评论分页 |
 | 下载某笔记图片/视频 | `python scripts/xhs.py download <note_id> [--no-video] [--overwrite]` | `--no-video` 不下载视频；`--overwrite` 重新下载已有文件 |
 | 推荐流/分类流 | `python scripts/xhs.py feed --category <cat> --pages 2 [--num 18]` | 分类见下方；`--num` 每页条数 |
@@ -208,7 +208,7 @@ python scripts/xhs.py accounts
 | 视频内容智能分析 | `python scripts/xhs.py analyze-video <note_id>` | 语音转文字 + 关键帧 OCR + AI 摘要 |
 | 配置视频分析 | `python scripts/xhs.py setup-video` | 交互选择 AI 摘要模式、Whisper 模型等 |
 
-> **单篇笔记完整处理**：抓取单条笔记时，必须依次执行 note → download → comments → analyze-images → export。详见「单篇笔记完整处理流程（强制标准）」节。
+> **单篇笔记完整处理**：抓取单条笔记时，必须依次执行 note → download → comments → analyze-images/analyze-video → export。详见「单篇笔记完整处理流程（强制标准）」节。
 
 **feed --category 可选值**：`recommend`（推荐，默认）、`food`（美食）、`fashion`（穿搭）、`travel`（旅行）、`beauty`（美妆）、`fitness`（健身）。
 
@@ -221,7 +221,34 @@ python scripts/xhs.py accounts
 --account <alias>                                   # 多账号时指定账号别名
 ```
 
-### Step 4：导出（按用户需要的格式）
+### Step 4：内容智能分析（每条笔记必须执行）
+
+**所有笔记都必须经过分析步骤**，这是输出质量的核心保证，不是可选环节。
+
+| 笔记类型 | 必须执行的分析命令 | 说明 |
+|---|---|---|
+| 图文笔记 | `analyze-images` | OCR 文字提取 + AI 视觉描述 |
+| 视频笔记 | `analyze-video` | 语音转文字 + 关键帧 OCR + AI 摘要 |
+
+```bash
+# 图文笔记
+python scripts/xhs.py analyze-images <note_id>
+
+# 视频笔记
+python scripts/xhs.py analyze-video <note_id>
+```
+
+> **批量模式（推荐）**：使用 `user` / `search` / `crawl-*` 命令时加 `--download --analyze`，在同一个进程内自动完成下载+分析，避免数据库锁冲突：
+> ```bash
+> python scripts/xhs.py user <user_id> --pages 3 --download --analyze
+> python scripts/xhs.py search "关键词" --pages 2 --download --analyze
+> python scripts/xhs.py crawl-user <user_id> --max-pages 20 --download --analyze
+> python scripts/xhs.py crawl-search "关键词" --max-pages 5 --download --analyze
+> ```
+
+> **分析依赖**（未安装时自动降级为仅 OCR）：ffmpeg（视频音频提取）、faster-whisper（语音转文字）、rapidocr-onnxruntime（OCR）。即便依赖不完整，analyze 步骤也必须执行——至少会产出 OCR 结果。
+
+### Step 5：导出（按用户需要的格式）
 
 ```bash
 python scripts/xhs.py export --note <note_id> --format md    # 单篇 Markdown
@@ -230,7 +257,7 @@ python scripts/xhs.py export --format csv                    # 全量 CSV（飞�
 
 输出位置：`data/output/`
 
-### Step 5：逐条报告（重要原则）
+### Step 6：逐条报告（重要原则）
 
 **禁止**："先把 100 条全部抓完，最后统一报告"。
 **正确**：每抓完一条立刻在终端打印一行（命令自带），完整入库后再抓下一条。这样用户随时可中断且已完成的数据已落盘。
@@ -245,17 +272,17 @@ python scripts/xhs.py export --format csv                    # 全量 CSV（飞�
 | `sign-test` | 三档签名健康检查 | 否 |
 | `login [--prefer <mode>] [--name <alias>]` | 获取并落库 cookie（`--name` 保存到 data/accounts/） | 否 |
 | `note <id>` | 单笔记详情入库 + MD 输出 | 是 |
-| `user <id> --pages N` | 用户信息 + 笔记列表前 N 页入库 | 是 |
-| `search <kw> --pages N` | 关键词搜索前 N 页入库 | 是 |
+| `user <id> --pages N [--download] [--analyze]` | 用户信息 + 笔记列表前 N 页入库 | 是 |
+| `search <kw> --pages N [--download] [--analyze]` | 关键词搜索前 N 页入库 | 是 |
 | `comments <id> [--max-pages N] [--max-sub-pages N] [--no-sub]` | 评论树（含子评论分页，`--no-sub` 跳过子评论） | 是 |
 | `download <id> [--no-video] [--overwrite]` | 图片/视频本地化 | 否 |
 | `feed --category <cat> --pages N [--num N]` | 推荐流/分类流浏览入库 | 是 |
-| `crawl-search <kw> --max-pages N [--resume] [--download] [--analyze]` | 关键词断点续抓 | 是 |
-| `crawl-user <id> --max-pages N [--resume] [--download] [--analyze]` | 用户全部笔记断点续抓 | 是 |
-| `crawl-feed --category <cat> --max-pages N [--resume] [--download] [--analyze]` | 推荐流断点续抓 | 是 |
-| `analyze-video <id> [--mode <mode>] [--whisper-model <m>] [--frame-interval N]` | 视频内容智能分析（语音转文字+OCR+AI摘要） | 否 |
+| `crawl-search <kw> --max-pages N [--resume] [--no-analyze]` | 关键词断点续抓（默认下载+分析） | 是 |
+| `crawl-user <id> --max-pages N [--resume] [--no-analyze]` | 用户全部笔记断点续抓（默认下载+分析） | 是 |
+| `crawl-feed --category <cat> --max-pages N [--resume] [--no-analyze]` | 推荐流断点续抓（默认下载+分析） | 是 |
+| `analyze-video <id> [--mode <mode>] [--whisper-model <m>] [--frame-interval N] [--step extract transcribe ocr summary]` | 视频内容智能分析（语音转文字+OCR+AI摘要）；`--step` 分段执行，适合 60s timeout 环境 | 否 |
 | `setup-video [--mode <mode>] [--whisper-model <m>] [--frame-interval N]` | 交互式配置视频分析 | 否 |
-| `analyze-images <id> [--mode <mode>] [--backend <b>] [--no-mermaid]` | 图片内容智能分析（OCR+AI视觉+Mermaid图表） | 否 |
+| `analyze-images <id> [--mode <mode>] [--backend <b>] [--no-mermaid] [--step ocr vision mermaid]` | 图片内容智能分析（OCR+AI视觉+Mermaid图表）；`--step` 分段执行 | 否 |
 | `setup-image [--mode <mode>] [--backend <b>] [--no-mermaid]` | 交互式配置图片分析 | 否 |
 | `setup-wizard` | 统一引导向导：配置图片+视频分析（推荐首次运行） | 否 |
 | `export --format md --note <id>` | 单篇 MD | 否 |
@@ -285,14 +312,14 @@ python scripts/xhs.py export --format md --note 6603abc123
 > **用户**："我想备份博主 5fa8xxx 的所有笔记，导成 csv 给飞书用"
 
 ```bash
-python scripts/xhs.py user 5fa8xxx --pages 50 --speed-mode slow
+python scripts/xhs.py user 5fa8xxx --pages 50 --speed-mode slow --download --analyze
 python scripts/xhs.py export --format csv
 ```
 
 > **用户**："搜'露营装备'前 3 页"
 
 ```bash
-python scripts/xhs.py search "露营装备" --pages 3
+python scripts/xhs.py search "露营装备" --pages 3 --download --analyze
 python scripts/xhs.py export --format csv
 ```
 
@@ -301,7 +328,7 @@ python scripts/xhs.py export --format csv
 → 切到 paranoid 并降级签名：
 ```bash
 python scripts/xhs.py sign-test  # 先确认签名档可用性
-python scripts/xhs.py user <id> --speed-mode paranoid --sign-mode playwright
+python scripts/xhs.py user <id> --speed-mode paranoid --sign-mode playwright --download --analyze
 ```
 
 仍不行 → 跳到「签名 JS 月度更新」节。
@@ -310,20 +337,22 @@ python scripts/xhs.py user <id> --speed-mode paranoid --sign-mode playwright
 
 ```bash
 python scripts/xhs.py feed --category recommend --pages 2
+# feed 不支持 --analyze，需要对单条笔记执行分析
+# 或使用 crawl-feed --download --analyze 自动分析
 python scripts/xhs.py export --format csv
 ```
 
 > **用户**："分析一下'露营'关键词下的评论情感"
 
 ```bash
-python scripts/xhs.py search "露营" --pages 3
+python scripts/xhs.py search "露营" --pages 3 --download --analyze
 python scripts/xhs.py analyze --type sentiment --keyword "露营"
 ```
 
 > **用户**："看看这个博主发的内容都有什么话题"
 
 ```bash
-python scripts/xhs.py user <user_id> --pages 10
+python scripts/xhs.py user <user_id> --pages 10 --download --analyze
 python scripts/xhs.py analyze --type topics --user <user_id>
 ```
 
@@ -346,7 +375,7 @@ python scripts/xhs.py refresh-cookies
 
 小红书大量博主以视频形式发布内容，视频分析功能可对已入库的视频笔记做深度内容提取：
 
-### 依赖（可选，缺失时优雅降级）
+### 依赖（未安装时自动降级为仅 OCR，但分析步骤必须执行）
 
 | 依赖 | 用途 | 安装 |
 |---|---|---|
@@ -390,16 +419,38 @@ python scripts/xhs.py analyze-video <video_note_id>
 python scripts/xhs.py analyze-video <video_note_id> --mode ollama
 ```
 
-### 长任务自动分析
+### 分段执行（解决 60 秒 timeout）
 
-crawl 命令支持 `--download`（自动下载媒体）和 `--analyze`（自动分析视频）：
+当终端环境有 60 秒执行限制时，使用 `--step` 分段执行，每段单独调用：
 
 ```bash
-# 搜索 + 自动下载 + 自动视频分析
-python scripts/xhs.py crawl-search "美食" --max-pages 5 --download --analyze
+# 第1步：提取音频+关键帧（约 10-20s）
+python scripts/xhs.py analyze-video <note_id> --step extract
 
-# 用户全部笔记 + 自动下载
-python scripts/xhs.py crawl-user <user_id> --max-pages 20 --download
+# 第2步：语音转录（约 30-120s，中间结果已缓存）
+python scripts/xhs.py analyze-video <note_id> --step transcribe
+
+# 第3步：OCR（约 5-15s）
+python scripts/xhs.py analyze-video <note_id> --step ocr
+
+# 第4步：生成摘要（约 5-10s）
+python scripts/xhs.py analyze-video <note_id> --step summary
+```
+
+也可以合并较短步骤：`--step extract transcribe` 或 `--step ocr summary`。
+
+中间结果缓存在视频目录的 `_cache/` 下（`audio.wav`、`transcript.json`、`ocr.json`），超时后下次调用自动复用。
+
+### 长任务自动分析
+
+crawl 命令**默认开启下载+分析**（`--download` 和 `--analyze` 默认为 True）。如需跳过可用 `--no-download` / `--no-analyze`。
+
+```bash
+# 默认行为：自动下载 + 自动分析
+python scripts/xhs.py crawl-search "美食" --max-pages 5
+
+# 跳过分析，仅入库+下载
+python scripts/xhs.py crawl-user <user_id> --max-pages 20 --no-analyze
 ```
 
 ### 输出
@@ -471,7 +522,7 @@ python scripts/xhs.py export --note <note_id> --format md
 | Layer 2: AI 视觉 | 内容描述 | AI "看懂"图片（路线、穿搭、步骤...） |
 | Layer 3: Mermaid | 图表生成 | 自动生成路线图/流程图（嵌入 MD） |
 
-### 依赖（可选，缺失时优雅降级）
+### 依赖（未安装时自动降级为仅 OCR，但分析步骤必须执行）
 
 | 依赖 | 用途 | 安装 |
 |---|---|---|
@@ -659,23 +710,27 @@ python scripts/xhs.py sign-test
 步骤 1: 抓取笔记详情
   python scripts/xhs.py note <note_id>
 
-步骤 2: 下载图片到本地
+步骤 2: 下载图片/视频到本地
   python scripts/xhs.py download <note_id>
 
 步骤 3: 抓取评论
   python scripts/xhs.py comments <note_id>
 
-步骤 4: 图片智能分析（OCR + AI 视觉）
+步骤 4: 内容智能分析（必须执行，根据类型分流）
+  # 图文笔记：
   python scripts/xhs.py analyze-images <note_id>
+  # 视频笔记：
+  python scripts/xhs.py analyze-video <note_id>
 
-步骤 5: [MCP 后端时] AI Agent 用 MCP 视觉工具完成图片分析
-  → 逐张分析图片 → 综合所有图片描述 → 写入 DB
+步骤 5: [MCP 后端时] AI Agent 用 MCP 视觉工具完成分析
+  → 图文：逐张分析图片 → 综合描述 → 写入 DB
+  → 视频：综合转录+OCR+帧画面 → 生成摘要 → 写入 DB
 
 步骤 6: 重新导出 Markdown（最终渲染，包含所有内容）
   python scripts/xhs.py export --note <note_id> --format md
 ```
 
-**不允许省略任何步骤。** 如果某步骤失败，应排查重试，而非跳过。
+**不允许省略任何步骤。** 步骤 4 是必须执行的——即便依赖不完整，至少会产出 OCR 结果。如果某步骤失败，应排查重试，而非跳过。
 
 ### 输出 Markdown 必须包含的结构
 
@@ -934,31 +989,33 @@ graph LR
 ```
 xiaohongshu_scraper_skill/
 ├── SKILL.md                 # 本文件
-├── README.md                # 详细文档
+├── README.md                # 快速开始文档
+├── TECHNICAL_REPORT.md      # 完整技术报告
 ├── requirements.txt
 ├── scripts/
 │   ├── xhs.py               # CLI 入口 + 命令调度
-│   ├── xhs_config.py        # 统一配置 + 路径 + 共享工具
-│   ├── xhs_fetcher.py       # Fetcher 核心类 + 错误处理
-│   ├── xhs_api.py           # API 函数 + 数据标准化
-│   ├── xhs_media.py         # 媒体下载 + 后处理
-│   ├── xhs_sign.py          # 三档签名
-│   ├── xhs_login.py         # 三档登录 + 在线 cookie 验证
-│   ├── xhs_login_native.py  # Playwright 原生登录（全平台，含在线验证）
-│   ├── xhs_login_wsl.py     # WSL 专用 DPAPI+CDP 登录
-│   ├── xhs_storage.py       # SQLite + MD/CSV 渲染
-│   ├── xhs_accounts.py      # 多账号管理与状态追踪
-│   ├── xhs_proxy.py         # 代理池
-│   ├── xhs_log.py           # 请求日志与统计
-│   ├── xhs_analyze.py       # 评论情感分析 & 话题聚类
-│   ├── xhs_update_js.py     # JS 签名资产自动更新
-│   ├── xhs_video.py         # 视频内容智能分析（语音转文字+OCR+AI摘要）
-│   ├── xhs_image.py         # 图片智能分析（OCR+AI视觉+Mermaid图表）
-│   ├── xhs_bootstrap.py     # 首次运行自动安装依赖
-├── assets/
-│   ├── xhs_main.js          # 签名核心（来自 cv-cat/Spider_XHS）
-│   ├── xhs_rap.js
-│   └── xhs_xray.js
+│   ├── xhs_config.py        # 统一配置 + 路径 + 共享工具 + 指纹池
+│   ├── xhs_fetcher.py       # Fetcher 核心类（TLS+节流+风控+浏览器接管）
+│   ├── xhs_api.py           # API 调用层 + 数据标准化
+│   ├── xhs_media.py         # 媒体下载 + 后处理编排
+│   ├── xhs_sign.py          # 三档签名引擎 + auto 路由
+│   ├── xhs_login.py         # 五档登录 fallback
+│   ├── xhs_login_native.py  # Windows/macOS 原生浏览器 Cookie 提取
+│   ├── xhs_login_wsl.py     # WSL 环境 CDP 桥接登录
+│   ├── xhs_storage.py       # SQLite 存储 + Markdown/CSV 渲染
+│   ├── xhs_accounts.py      # 多账号池（LRU 轮换 + 冷却 + 指纹绑定）
+│   ├── xhs_proxy.py         # 代理池（轮换 + 指数冷却）
+│   ├── xhs_log.py           # 结构化 JSONL 请求日志
+│   ├── xhs_analyze.py       # 评论情感分析 + 话题聚类
+│   ├── xhs_update_js.py     # 签名 JS 自动更新（从 GitHub）
+│   ├── xhs_video.py         # 视频分析（语音转写 + OCR + AI 摘要）
+│   ├── xhs_image.py         # 图片分析（OCR + AI 视觉 + Mermaid）
+│   └── xhs_bootstrap.py     # 依赖自动安装
+├── assets/                  # 签名 JS 资产
+│   ├── xhs_main.js          # 主签名算法（社区维护，约月度轮换）
+│   ├── xhs_rap.js           # x-rap-param 签名
+│   ├── xhs_xray.js          # x-xray-traceid 签名
+│   └── crypto-js.min.js     # CryptoJS（mini-racer 路径用）
 ├── tests/                   # 测试套件（pytest）
 │   ├── conftest.py           # 共享 fixture
 │   ├── test_normalize.py     # API 数据标准化测试
@@ -966,11 +1023,13 @@ xiaohongshu_scraper_skill/
 │   ├── test_accounts.py      # 多账号管理测试
 │   ├── test_proxy.py         # 代理池测试
 │   └── test_image.py         # 图片分析测试
-└── data/
-    ├── xhs.db               # SQLite
-    ├── cookies.json          # 持久化 cookie（0600）
-    ├── accounts/             # 多账号 cookie 存储
-    ├── media/                # 媒体文件：<博主名>/<笔记标题>/img_01.jpg
+└── data/                     # 运行时数据（自动生成）
+    ├── accounts/<alias>.json # 多账号 Cookie 文件
+    ├── accounts_state.json   # 账号运行时状态
+    ├── cookies.json           # 单账号 Cookie（兼容）
+    ├── xhs.db                # SQLite 数据库
+    ├── runs.jsonl             # 请求日志
+    ├── media/                # 媒体文件：<博主名>/<笔记标题>/
     └── output/               # MD + CSV
 ```
 

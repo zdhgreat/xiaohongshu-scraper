@@ -162,6 +162,38 @@ def find_video_local(note_id: str, conn: sqlite3.Connection) -> Path | None:
     return None
 
 
+def _refresh_video_url(note_id: str, conn: sqlite3.Connection) -> None:
+    """当 video_url 为空时，抓笔记详情补全 video_url/type 等字段。
+
+    user_posted / search 等列表 API 返回的是摘要数据，不含完整 video URL。
+    通过 feed API 获取完整数据并更新 DB。
+    """
+    try:
+        import xhs_api
+        import xhs_storage
+        row = xhs_storage.get_note(conn, note_id)
+        if not row:
+            return
+        xsec_token = row["xsec_token"] or ""
+        xsec_source = row["xsec_source"] or "pc_search"
+        # 需要一个 fetcher 实例 — 用全局或延迟导入
+        from xhs_fetcher import Fetcher
+        from xhs_config import COOKIES_PATH
+        import xhs_accounts
+        fetcher = xhs_accounts.get_fetcher()
+        if not fetcher:
+            return
+        item = xhs_api.fetch_note_detail(fetcher, note_id, xsec_token, xsec_source)
+        note = xhs_api._normalize_note(item)
+        note["user_id"] = row["user_id"]
+        xhs_storage.upsert_note(conn, note)
+        conn.commit()
+        if note.get("video_url"):
+            print(f"    [refresh] 已补全 video_url", file=sys.stderr)
+    except Exception as e:
+        print(f"    [refresh] 补全 video_url 失败: {e}", file=sys.stderr)
+
+
 def post_process_note(note: dict, conn: sqlite3.Connection, args) -> None:
     """根据 --download / --analyze 标志对单条笔记做后处理。"""
     do_download = getattr(args, "download", False)
@@ -191,7 +223,10 @@ def post_process_note(note: dict, conn: sqlite3.Connection, args) -> None:
             import xhs_video
             video_local = find_video_local(note_id, conn)
             if not video_local:
-                # 先下载
+                # video_url 可能为空（列表 API 不返回完整 video 信息）
+                # 先尝试抓笔记详情补全 video_url
+                if not note.get("video_url"):
+                    _refresh_video_url(note_id, conn)
                 _, _, _, out = download_media(note_id, conn, with_video=True)
                 video_local = out / "video.mp4"
             if video_local.exists():
@@ -213,6 +248,8 @@ def post_process_note(note: dict, conn: sqlite3.Connection, args) -> None:
                     updates.append("摘要")
                 detail = "、".join(updates) if updates else "无新内容"
                 print(f"    [analyze] 《{title}》: {detail}", file=sys.stderr)
+            else:
+                print(f"    [analyze] 《{title}》视频下载失败，跳过分析", file=sys.stderr)
         except Exception as e:
             print(f"    [analyze] 《{title}》失败: {e}", file=sys.stderr)
     elif do_analyze and not is_video:

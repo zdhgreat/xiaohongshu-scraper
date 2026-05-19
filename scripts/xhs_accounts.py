@@ -48,6 +48,7 @@ class Account:
     last_461_count: int = 0
     total_calls: int = 0
     fingerprint: Any = None  # FingerprintProfile，由 _load_accounts 分配
+    proxy_url: str | None = None  # 绑定的专属代理 URL
 
     def load(self) -> None:
         if not self.cookies_path.exists():
@@ -145,6 +146,7 @@ class AccountManager:
                 a.last_460_count = s.get("last_460_count", 0)
                 a.last_461_count = s.get("last_461_count", 0)
                 a.total_calls = s.get("total_calls", 0)
+                a.proxy_url = s.get("proxy_url")
 
     def save_state(self) -> None:
         state = {a.alias: {
@@ -155,6 +157,7 @@ class AccountManager:
             "last_460_count": a.last_460_count,
             "last_461_count": a.last_461_count,
             "total_calls": a.total_calls,
+            "proxy_url": a.proxy_url,
         } for a in self.accounts.values()}
         try:
             ACCOUNTS_STATE.parent.mkdir(parents=True, exist_ok=True)

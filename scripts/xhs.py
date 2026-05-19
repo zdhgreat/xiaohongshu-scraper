@@ -159,6 +159,7 @@ def _make_fetcher(args: argparse.Namespace) -> Fetcher:
 # ---------------------------------------------------------------------------
 
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from typing import Generator
 
 @contextmanager
@@ -342,6 +343,8 @@ def cmd_user(args: argparse.Namespace) -> int:
                 tag = _type_tag(note)
                 preview = _desc_preview(note)
                 print(f"  [{total}] [{tag}] {note['note_id']} token={token_mark} {preview}")
+                # --download / --analyze 后处理
+                xhs_media.post_process_note(note, conn, args)
             conn.commit()
             cursor = data.get("cursor", "")
             if not data.get("has_more"):
@@ -377,6 +380,8 @@ def cmd_search(args: argparse.Namespace) -> int:
                 tag = _type_tag(note)
                 preview = _desc_preview(note)
                 print(f"  [{total}] [{tag}] {note['note_id']} token={token_mark} {preview}")
+                # --download / --analyze 后处理
+                xhs_media.post_process_note(note, conn, args)
             xhs_storage.save_search_page(conn, args.keyword, page, note_ids)
             conn.commit()
             if not data.get("has_more"):
@@ -456,6 +461,268 @@ def cmd_comments(args: argparse.Namespace) -> int:
         return 0
 
 
+def cmd_health(args: argparse.Namespace) -> int:
+    """系统健康检查：依赖、签名、账号、数据库。返回码 0=健康, 1=降级, 2=严重。"""
+    issues: list[tuple[int, str]] = []  # (severity, message)
+
+    # 1. Python 核心依赖
+    print("=== Python 依赖 ===")
+    core_deps = [
+        ("curl_cffi", "curl_cffi", "反风控 Chrome TLS 模拟"),
+        ("execjs", "PyExecJS", "签名引擎"),
+        ("cryptography", "cryptography", "WSL cookie 解密"),
+    ]
+    for mod_name, display_name, feature in core_deps:
+        try:
+            __import__(mod_name)
+            print(f"  OK   {display_name:30s} {feature}")
+        except ImportError:
+            print(f"  MISS {display_name:30s} {feature}")
+            issues.append((1, f"{display_name} 未安装 → {feature}"))
+
+    # 2. Node.js + crypto-js
+    print("\n=== Node.js + 签名依赖 ===")
+    import xhs_bootstrap
+    node_path = xhs_bootstrap._find_node()
+    if node_path:
+        print(f"  OK   {'Node.js':30s} {node_path}")
+    else:
+        print(f"  CRIT {'Node.js':30s} 未找到")
+        issues.append((2, "Node.js 未安装"))
+    if xhs_bootstrap._has_crypto_js():
+        print(f"  OK   {'crypto-js':30s} 签名算法核心")
+    else:
+        print(f"  CRIT {'crypto-js':30s} 未找到")
+        issues.append((2, "crypto-js 未安装"))
+
+    # 3. 可选依赖
+    print("\n=== 可选依赖 ===")
+    opt_deps = [
+        ("playwright", "Playwright", "QR 登录 / 浏览器接管"),
+        ("jieba", "jieba", "本地文本分析"),
+        ("rapidocr_onnxruntime", "rapidocr", "图片/视频 OCR"),
+    ]
+    for mod_name, display_name, feature in opt_deps:
+        try:
+            __import__(mod_name)
+            print(f"  OK   {display_name:30s} {feature}")
+        except ImportError:
+            print(f"  MISS {display_name:30s} {feature}")
+            issues.append((1, f"{display_name} 未安装 → {feature}"))
+    # ffmpeg
+    import subprocess as _sp
+    try:
+        _sp.run(["ffmpeg", "-version"], capture_output=True, timeout=5, check=True)
+        print(f"  OK   {'ffmpeg':30s} 视频分析")
+    except Exception:
+        print(f"  MISS {'ffmpeg':30s} 视频分析（系统级工具）")
+        issues.append((1, "ffmpeg 未安装"))
+
+    # 4. 签名探针
+    print("\n=== 签名层 ===")
+    ver = xhs_sign._load_js_version()
+    js_ver = ver.get("commit_short", "未知")
+    print(f"  INFO JS 版本: {js_ver}")
+    try:
+        test_results = xhs_sign.run_sign_test()
+        for name, ok in test_results.items():
+            status = "OK" if ok else "FAIL"
+            print(f"  {status:4s} {name}")
+            if not ok:
+                issues.append((1, f"签名器 {name} 失败"))
+        if not any(test_results.values()):
+            issues.append((2, "所有签名器都失败"))
+    except Exception as e:
+        print(f"  CRIT 签名测试失败: {e}")
+        issues.append((2, f"签名层异常: {e}"))
+
+    # 5. 账号状态
+    print("\n=== 账号 ===")
+    mgr = xhs_accounts.AccountManager()
+    if not mgr.has_accounts():
+        print("  CRIT 无账号（先运行 login）")
+        issues.append((2, "无账号"))
+    else:
+        for s in mgr.stats():
+            cd = " cooldown" if s["cooldown_until"] else ""
+            print(f"  {s['alias']:15s} 日抓 {s['daily_count']:3d}/{xhs_config.DAILY_HARD_CAP}{cd}")
+            if s["cooldown_until"]:
+                issues.append((1, f"账号 {s['alias']} 冷却中"))
+
+    # 6. 数据库
+    print("\n=== 数据库 ===")
+    try:
+        conn = xhs_storage.connect()
+        try:
+            result = conn.execute("PRAGMA integrity_check").fetchone()
+            if result[0] == "ok":
+                print("  OK   SQLite 完整性检查通过")
+                total = conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
+                users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+                comments = conn.execute("SELECT COUNT(*) FROM comments").fetchone()[0]
+                print(f"  INFO notes: {total} | users: {users} | comments: {comments}")
+            else:
+                print(f"  CRIT SQLite 完整性异常: {result[0]}")
+                issues.append((2, f"数据库损坏: {result[0]}"))
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"  CRIT 数据库连接失败: {e}")
+        issues.append((2, f"数据库异常: {e}"))
+
+    # 汇总
+    severity = max((sev for sev, _ in issues), default=0)
+    labels = {0: "健康", 1: "降级", 2: "严重"}
+    print(f"\n=== 结果: {labels[severity]} ({len(issues)} 个问题) ===")
+    for sev, msg in issues:
+        tag = ["", "WARN", "CRIT"][sev]
+        print(f"  [{tag}] {msg}")
+    return severity
+
+
+def cmd_cleanup(args: argparse.Namespace) -> int:
+    """数据清理：孤儿媒体、过期缓存、可选 VACUUM。"""
+    conn = xhs_storage.connect()
+    try:
+        dry = getattr(args, "dry_run", False)
+
+        # 1. 孤儿媒体清理
+        media_dir = xhs_config.MEDIA_DIR
+        orphan_count = 0
+        freed_bytes = 0
+        if media_dir.exists():
+            # 收集所有有效的媒体目录
+            valid_paths: set[Path] = set()
+            for (note_id,) in conn.execute("SELECT note_id FROM notes").fetchall():
+                new_dir = xhs_config.note_media_dir(note_id, conn)
+                valid_paths.add(new_dir.resolve())
+                valid_paths.add((media_dir / note_id).resolve())
+
+            for child in media_dir.iterdir():
+                if not child.is_dir():
+                    continue
+                resolved = child.resolve()
+                if resolved in valid_paths:
+                    continue
+                # 子目录也检查（新格式 author/title）
+                if any(resolved == vp or resolved.is_relative_to(vp) for vp in valid_paths):
+                    continue
+                size = sum(f.stat().st_size for f in child.rglob("*") if f.is_file())
+                orphan_count += 1
+                freed_bytes += size
+                if dry:
+                    print(f"  [DRY-RUN] 将删除: {child.name} ({size / 1024:.0f} KB)")
+                else:
+                    import shutil
+                    shutil.rmtree(child, ignore_errors=True)
+            if orphan_count:
+                label = "将删除" if dry else "已删除"
+                print(f"  孤儿媒体: {label} {orphan_count} 个目录 ({freed_bytes / 1024:.0f} KB)")
+            else:
+                print("  孤儿媒体: 无")
+
+        # 2. 过期 search_cache
+        cache_days = getattr(args, "max_cache_days", 30)
+        deleted_cache = 0
+        if cache_days > 0:
+            try:
+                # 删除空记录 + 超龄记录
+                deleted_cache += conn.execute(
+                    "DELETE FROM search_cache WHERE note_ids = '' OR note_ids = '[]'"
+                ).rowcount
+                deleted_cache += conn.execute(
+                    "DELETE FROM search_cache WHERE crawled_at < datetime('now', ?)",
+                    (f"-{cache_days} days",),
+                ).rowcount
+            except Exception:
+                pass
+        if dry and deleted_cache:
+            print(f"  [DRY-RUN] 将清理 {deleted_cache} 条空搜索缓存")
+        elif deleted_cache:
+            print(f"  搜索缓存: 已清理 {deleted_cache} 条空记录")
+
+        # 3. 过期 crawl_state
+        state_days = getattr(args, "max_state_days", 7)
+        if state_days > 0:
+            try:
+                deleted_state = conn.execute(
+                    "DELETE FROM crawl_state WHERE status IN ('completed', 'paused')"
+                ).rowcount
+                if deleted_state:
+                    label = "将清理" if dry else "已清理"
+                    print(f"  抓取状态: {label} {deleted_state} 条已完成/暂停记录")
+                else:
+                    print("  抓取状态: 无需清理")
+            except Exception:
+                pass
+
+        if not dry:
+            conn.commit()
+
+        # 4. VACUUM
+        if getattr(args, "vacuum", False) and not dry:
+            print("  VACUUM: 正在压缩数据库...")
+            conn.execute("VACUUM")
+            print("  VACUUM: 完成")
+        elif getattr(args, "vacuum", False):
+            print("  [DRY-RUN] VACUUM: 将压缩数据库")
+
+        print("[OK] 数据清理完成")
+        return 0
+    finally:
+        conn.close()
+
+
+def cmd_refresh(args: argparse.Namespace) -> int:
+    """重抓超过 N 小时的笔记（增量更新）。"""
+    with fetch_session(args) as (fetcher, conn):
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=args.max_age_hours)).strftime("%Y-%m-%d %H:%M:%S")
+        rows = conn.execute(
+            "SELECT note_id, xsec_token, xsec_source FROM notes "
+            "WHERE crawled_at < ? ORDER BY crawled_at ASC LIMIT ?",
+            (cutoff, args.limit),
+        ).fetchall()
+        if not rows:
+            print(f"[OK] 没有 {args.max_age_hours} 小时前的旧笔记需要刷新")
+            return 0
+        print(f"[REFRESH] 找到 {len(rows)} 条超过 {args.max_age_hours}h 的旧笔记", file=sys.stderr)
+        updated = 0
+        skipped = 0
+        for row in rows:
+            note_id = row["note_id"]
+            xsec_token = row["xsec_token"] or ""
+            xsec_source = row["xsec_source"] or "pc_search"
+            try:
+                item = fetch_note_detail(fetcher, note_id, xsec_token=xsec_token, xsec_source=xsec_source)
+                note = _normalize_note(item)
+                note["note_id"] = note_id
+                if not note.get("xsec_token") and xsec_token:
+                    note["xsec_token"] = xsec_token
+                    note["xsec_source"] = xsec_source
+                # 检查是否被跳过（content_hash 相同）
+                old_hash = conn.execute(
+                    "SELECT content_hash FROM notes WHERE note_id = ?", (note_id,)
+                ).fetchone()
+                old_hash_val = old_hash["content_hash"] if old_hash else ""
+                xhs_storage.upsert_note(conn, note)
+                if note["user_id"]:
+                    user = (item.get("note_card") or {}).get("user") or {}
+                    user["user_id"] = note["user_id"]
+                    xhs_storage.upsert_user(conn, _normalize_user(user))
+                conn.commit()
+                if old_hash_val and old_hash_val == note.get("content_hash", ""):
+                    skipped += 1
+                    print(f"  [{updated + skipped}/{len(rows)}] {note_id} 未变更（跳过）")
+                else:
+                    updated += 1
+                    title = note.get("title", "")[:40]
+                    print(f"  [{updated + skipped}/{len(rows)}] {note_id} 已更新: 《{title}》")
+            except Exception as e:
+                print(f"  [{updated + skipped + 1}/{len(rows)}] {note_id} 失败: {e}", file=sys.stderr)
+        print(f"[OK] 刷新完成: {updated} 条更新, {skipped} 条未变更")
+        return 0
+
+
 def cmd_export(args: argparse.Namespace) -> int:
     conn = xhs_storage.connect()
     try:
@@ -474,6 +741,19 @@ def cmd_export(args: argparse.Namespace) -> int:
             summary = xhs_storage.render_update_summary(conn, args.note)
             if summary:
                 print(f"     内容: {summary}")
+        elif args.format == "json":
+            total = conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
+            path = xhs_storage.write_json(conn)
+            print(f"[OK] 已导出 JSON（共 {total} 条笔记）")
+            print(f"     文件: {path}")
+        elif args.format == "xlsx":
+            total = conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
+            try:
+                path = xhs_storage.write_xlsx(conn)
+                print(f"[OK] 已导出 XLSX（共 {total} 条笔记）")
+                print(f"     文件: {path}")
+            except ImportError:
+                return 1
         else:
             total = conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
             path = xhs_storage.write_csv(conn)
@@ -668,11 +948,12 @@ def cmd_crawl_search(args: argparse.Namespace) -> int:
             print(f"[OK] crawl-search '{args.keyword}' 完成：{total} 条新增（下次 --resume 从 page {last_page + 1}）")
             return 0
         except FatalRiskError as e:
+            paused_page = page if 'page' in dir() else last_page + 1
             xhs_storage.update_crawl_state(
                 conn, task_id, "search", args.keyword,
-                str(max(page, last_page + 1)), "paused", str(e),
+                str(max(paused_page, last_page + 1)), "paused", str(e),
             )
-            print(f"[PAUSED] 在第 {page} 页因风控暂停：{e}\n下次用 --resume 继续。", file=sys.stderr)
+            print(f"[PAUSED] 在第 {paused_page} 页因风控暂停：{e}\n下次用 --resume 继续。", file=sys.stderr)
             return 2
 
 
@@ -760,6 +1041,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_setup = sub.add_parser("setup", help="安装所有依赖（首次运行自动触发，此命令用于排查）")
     p_setup.set_defaults(func=cmd_setup)
 
+    p_health = sub.add_parser("health", help="系统健康检查（依赖+签名+账号+DB）")
+    p_health.set_defaults(func=cmd_health)
+
     p_login = sub.add_parser("login", help="获取并保存 cookie")
     p_login.add_argument("--prefer",
                           choices=["auto", "win-edge", "win-chrome", "rookie",
@@ -781,12 +1065,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_user = sub.add_parser("user", help="抓用户主页 + 笔记列表前 N 页")
     p_user.add_argument("user_id")
     p_user.add_argument("--pages", type=int, default=3)
+    p_user.add_argument("--download", action="store_true", help="每条笔记入库后自动下载媒体")
+    p_user.add_argument("--analyze", action="store_true", help="视频笔记自动做视频分析（需 ffmpeg）")
     _add_common(p_user)
     p_user.set_defaults(func=cmd_user)
 
     p_search = sub.add_parser("search", help="关键词搜索前 N 页")
     p_search.add_argument("keyword")
     p_search.add_argument("--pages", type=int, default=2)
+    p_search.add_argument("--download", action="store_true", help="每条笔记入库后自动下载媒体")
+    p_search.add_argument("--analyze", action="store_true", help="视频笔记自动做视频分析（需 ffmpeg）")
     _add_common(p_search)
     p_search.set_defaults(func=cmd_search)
 
@@ -808,8 +1096,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_cs.add_argument("keyword")
     p_cs.add_argument("--max-pages", type=int, default=20)
     p_cs.add_argument("--resume", action="store_true", help="从 crawl_state 里的 cursor 继续")
-    p_cs.add_argument("--download", action="store_true", help="每条笔记入库后自动下载媒体")
-    p_cs.add_argument("--analyze", action="store_true", help="视频笔记自动做视频分析（需 ffmpeg）")
+    p_cs.add_argument("--download", action="store_true", default=True, help="自动下载媒体（默认开启）")
+    p_cs.add_argument("--no-download", dest="download", action="store_false", help="不下载媒体")
+    p_cs.add_argument("--analyze", action="store_true", default=True, help="自动内容分析（默认开启）")
+    p_cs.add_argument("--no-analyze", dest="analyze", action="store_false", help="不分析内容")
     _add_common(p_cs)
     p_cs.set_defaults(func=cmd_crawl_search)
 
@@ -817,13 +1107,28 @@ def build_parser() -> argparse.ArgumentParser:
     p_cu.add_argument("user_id")
     p_cu.add_argument("--max-pages", type=int, default=50)
     p_cu.add_argument("--resume", action="store_true")
-    p_cu.add_argument("--download", action="store_true", help="每条笔记入库后自动下载媒体")
-    p_cu.add_argument("--analyze", action="store_true", help="视频笔记自动做视频分析（需 ffmpeg）")
+    p_cu.add_argument("--download", action="store_true", default=True, help="自动下载媒体（默认开启）")
+    p_cu.add_argument("--no-download", dest="download", action="store_false", help="不下载媒体")
+    p_cu.add_argument("--analyze", action="store_true", default=True, help="自动内容分析（默认开启）")
+    p_cu.add_argument("--no-analyze", dest="analyze", action="store_false", help="不分析内容")
     _add_common(p_cu)
     p_cu.set_defaults(func=cmd_crawl_user)
 
-    p_exp = sub.add_parser("export", help="从 DB 导出 MD/CSV")
-    p_exp.add_argument("--format", choices=["md", "csv"], default="csv")
+    p_clean = sub.add_parser("cleanup", help="数据清理：孤儿媒体、过期缓存")
+    p_clean.add_argument("--dry-run", action="store_true", help="只显示要删除的内容")
+    p_clean.add_argument("--max-cache-days", type=int, default=30, help="清理 N 天前的空搜索缓存（默认 30）")
+    p_clean.add_argument("--max-state-days", type=int, default=7, help="清理 N 天前的已完成抓取状态（默认 7）")
+    p_clean.add_argument("--vacuum", action="store_true", help="SQLite VACUUM 压缩数据库")
+    p_clean.set_defaults(func=cmd_cleanup)
+
+    p_ref = sub.add_parser("refresh", help="重抓超过 N 小时的旧笔记（增量更新）")
+    p_ref.add_argument("--max-age-hours", type=int, default=24, help="重抓 N 小时前的笔记（默认 24）")
+    p_ref.add_argument("--limit", type=int, default=100, help="最多刷新几条（默认 100）")
+    _add_common(p_ref)
+    p_ref.set_defaults(func=cmd_refresh)
+
+    p_exp = sub.add_parser("export", help="从 DB 导出 MD/CSV/JSON/XLSX")
+    p_exp.add_argument("--format", choices=["md", "csv", "json", "xlsx"], default="csv")
     p_exp.add_argument("--note", default=None, help="单篇 MD 时指定 note_id")
     p_exp.set_defaults(func=cmd_export)
 
@@ -850,8 +1155,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_cf.add_argument("--category", choices=list(xhs_config.FEED_CATEGORIES.keys()), default="recommend")
     p_cf.add_argument("--max-pages", type=int, default=20)
     p_cf.add_argument("--resume", action="store_true")
-    p_cf.add_argument("--download", action="store_true", help="每条笔记入库后自动下载媒体")
-    p_cf.add_argument("--analyze", action="store_true", help="视频笔记自动做视频分析（需 ffmpeg）")
+    p_cf.add_argument("--download", action="store_true", default=True, help="自动下载媒体（默认开启）")
+    p_cf.add_argument("--no-download", dest="download", action="store_false", help="不下载媒体")
+    p_cf.add_argument("--analyze", action="store_true", default=True, help="自动内容分析（默认开启）")
+    p_cf.add_argument("--no-analyze", dest="analyze", action="store_false", help="不分析内容")
     _add_common(p_cf)
     p_cf.set_defaults(func=cmd_crawl_feed)
 
@@ -874,6 +1181,9 @@ def build_parser() -> argparse.ArgumentParser:
                       help="AI 摘要模式（覆盖配置文件）")
     p_av.add_argument("--whisper-model", default=None, help="Whisper 模型（tiny/base/small/medium/large-v3）")
     p_av.add_argument("--frame-interval", type=int, default=None, help="关键帧间隔秒数")
+    p_av.add_argument("--step", nargs="*", default=None,
+                      help="分段执行: extract transcribe ocr summary（不传=全部执行）。"
+                           "适合终端 timeout 60s 的环境，每步单独调用")
     _add_common(p_av)
     p_av.set_defaults(func=cmd_analyze_video)
 
@@ -891,6 +1201,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_ai.add_argument("--backend", choices=["ollama", "api", "mcp"], default=None,
                       help="视觉后端（覆盖配置文件）")
     p_ai.add_argument("--no-mermaid", action="store_true", help="关闭 Mermaid 图表生成")
+    p_ai.add_argument("--step", nargs="*", default=None,
+                      help="分段执行: ocr vision mermaid（不传=全部执行）。"
+                           "适合终端 timeout 60s 的环境")
     _add_common(p_ai)
     p_ai.set_defaults(func=cmd_analyze_images)
 
