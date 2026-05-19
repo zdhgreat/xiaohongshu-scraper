@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+data/
+.venv/
+.env
+# Added by code-review-graph
+.code-review-graph/

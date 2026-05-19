@@ -1,0 +1,16 @@
+name: xiaohongshu-scraper
+description: 抓取小红书笔记、用户主页、关键词搜索结果，落库 SQLite 并导出 Markdown / CSV（飞书多维表格格式）
+version: "0.1.0"
+author: zhudonghai
+type: skill
+entrypoint: scripts/xhs.py
+tags:
+  - xiaohongshu
+  - rednote
+  - xhs
+  - scraper
+  - crawler
+  - content-collection
+  - feishu
+  - data-export
+license: MIT

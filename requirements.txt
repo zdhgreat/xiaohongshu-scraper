@@ -1,0 +1,17 @@
+# core
+requests>=2.31              # fallback HTTP
+curl_cffi>=0.5.10           # Chrome TLS/JA3/JA4 fingerprint
+PyExecJS>=1.5.1             # JS signing engine (needs Node.js + crypto-js)
+cryptography>=42.0          # WSL cookie decrypt / AES-GCM
+# optional (graceful degradation)
+py-mini-racer>=0.6.0        # backup JS engine when no Node.js
+rookiepy>=0.5.6 ; python_version < "3.13"   # browser cookie extract; no 3.13+ wheel
+playwright>=1.42            # QR login / browser takeover / playwright signer
+qrcode>=7.4
+pillow>=10.0
+# P3 analysis (optional)
+snownlp>=0.12.0             # Chinese sentiment analysis
+jieba>=0.42.1               # Chinese segmentation + TF-IDF
+# P4 video/image analysis (optional)
+faster-whisper>=1.0         # speech-to-text (local, Chinese supported)
+rapidocr-onnxruntime>=1.3   # OCR (pure Python, CPU)
