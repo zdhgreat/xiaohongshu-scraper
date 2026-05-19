@@ -242,9 +242,11 @@ python scripts/xhs.py analyze-video <note_id>
 > ```bash
 > python scripts/xhs.py user <user_id> --pages 3 --download --analyze
 > python scripts/xhs.py search "关键词" --pages 2 --download --analyze
-> python scripts/xhs.py crawl-user <user_id> --max-pages 20 --download --analyze
-> python scripts/xhs.py crawl-search "关键词" --max-pages 5 --download --analyze
+> python scripts/xhs.py crawl-user <user_id> --max-pages 20
+> python scripts/xhs.py crawl-search "关键词" --max-pages 5
 > ```
+>
+> **注意**：以上命令含视频分析时，单条视频需要 2-5 分钟。执行时请设置充足 timeout（建议 600 秒以上），或使用 crawl 命令让 skill 内部调度。
 
 > **分析依赖**（未安装时自动降级为仅 OCR）：ffmpeg（视频音频提取）、faster-whisper（语音转文字）、rapidocr-onnxruntime（OCR）。即便依赖不完整，analyze 步骤也必须执行——至少会产出 OCR 结果。
 
@@ -280,7 +282,7 @@ python scripts/xhs.py export --format csv                    # 全量 CSV（飞�
 | `crawl-search <kw> --max-pages N [--resume] [--no-analyze]` | 关键词断点续抓（默认下载+分析） | 是 |
 | `crawl-user <id> --max-pages N [--resume] [--no-analyze]` | 用户全部笔记断点续抓（默认下载+分析） | 是 |
 | `crawl-feed --category <cat> --max-pages N [--resume] [--no-analyze]` | 推荐流断点续抓（默认下载+分析） | 是 |
-| `analyze-video <id> [--mode <mode>] [--whisper-model <m>] [--frame-interval N] [--step extract transcribe ocr summary]` | 视频内容智能分析（语音转文字+OCR+AI摘要）；`--step` 分段执行，适合 60s timeout 环境 | 否 |
+| `analyze-video <id> [--mode <mode>] [--whisper-model <m>] [--frame-interval N] [--step extract transcribe ocr summary]` | 视频内容智能分析（**单条约 2-5 分钟，timeout 需 >=300s**；或改用 crawl 命令） | 否 |
 | `setup-video [--mode <mode>] [--whisper-model <m>] [--frame-interval N]` | 交互式配置视频分析 | 否 |
 | `analyze-images <id> [--mode <mode>] [--backend <b>] [--no-mermaid] [--step ocr vision mermaid]` | 图片内容智能分析（OCR+AI视觉+Mermaid图表）；`--step` 分段执行 | 否 |
 | `setup-image [--mode <mode>] [--backend <b>] [--no-mermaid]` | 交互式配置图片分析 | 否 |
@@ -419,27 +421,43 @@ python scripts/xhs.py analyze-video <video_note_id>
 python scripts/xhs.py analyze-video <video_note_id> --mode ollama
 ```
 
-### 分段执行（解决 60 秒 timeout）
+### 视频分析耗时预期（重要）
 
-当终端环境有 60 秒执行限制时，使用 `--step` 分段执行，每段单独调用：
+**`analyze-video` 单条视频需要 2-5 分钟**（Whisper 模型加载 15-30s + 语音转录 30-120s + OCR 5-15s + 摘要 5-10s）。
+
+> **执行要求**：运行 `analyze-video` 时，终端 timeout 必须设置为 **300 秒（5分钟）以上**。如果终端环境硬限制 60 秒，请改用下方 `crawl-*` 命令或 `--step` 分段模式。
+
+**推荐方式一：crawl 命令（不受终端 timeout 限制）**
+
+crawl 命令在单进程内完成所有操作，agent 只需等待最终结果：
+
+```bash
+# 推荐：crawl 命令默认下载+分析，内部调度不受 timeout 干扰
+python scripts/xhs.py crawl-user <user_id> --max-pages 2
+python scripts/xhs.py crawl-search "关键词" --max-pages 3
+```
+
+**推荐方式二：单独 analyze-video + 充足 timeout**
+
+```bash
+# agent 应设置 timeout >= 300s
+python scripts/xhs.py analyze-video <note_id>
+```
+
+**方式三：--step 分段执行（仅当 timeout 无法调整时）**
 
 ```bash
 # 第1步：提取音频+关键帧（约 10-20s）
 python scripts/xhs.py analyze-video <note_id> --step extract
 
-# 第2步：语音转录（约 30-120s，中间结果已缓存）
+# 第2步：语音转录（约 30-120s，设置 timeout>=180s）
 python scripts/xhs.py analyze-video <note_id> --step transcribe
 
-# 第3步：OCR（约 5-15s）
-python scripts/xhs.py analyze-video <note_id> --step ocr
-
-# 第4步：生成摘要（约 5-10s）
-python scripts/xhs.py analyze-video <note_id> --step summary
+# 第3步：OCR + 摘要（约 10-20s）
+python scripts/xhs.py analyze-video <note_id> --step ocr summary
 ```
 
-也可以合并较短步骤：`--step extract transcribe` 或 `--step ocr summary`。
-
-中间结果缓存在视频目录的 `_cache/` 下（`audio.wav`、`transcript.json`、`ocr.json`），超时后下次调用自动复用。
+中间结果缓存在视频目录的 `_cache/` 下，超时后下次调用自动复用。
 
 ### 长任务自动分析
 
