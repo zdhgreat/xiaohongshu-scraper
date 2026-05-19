@@ -1181,9 +1181,10 @@ def build_parser() -> argparse.ArgumentParser:
                       help="AI 摘要模式（覆盖配置文件）")
     p_av.add_argument("--whisper-model", default=None, help="Whisper 模型（tiny/base/small/medium/large-v3）")
     p_av.add_argument("--frame-interval", type=int, default=None, help="关键帧间隔秒数")
+    p_av.add_argument("--max-duration", type=int, default=None,
+                      help="最多转录前 N 秒音频（默认 300，0=不限制）")
     p_av.add_argument("--step", nargs="*", default=None,
-                      help="分段执行: extract transcribe ocr summary（不传=全部执行）。"
-                           "适合终端 timeout 60s 的环境，每步单独调用")
+                      help="分段执行: extract transcribe ocr summary（不传=全部执行）")
     _add_common(p_av)
     p_av.set_defaults(func=cmd_analyze_video)
 

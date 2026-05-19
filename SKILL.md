@@ -423,9 +423,23 @@ python scripts/xhs.py analyze-video <video_note_id> --mode ollama
 
 ### 视频分析耗时预期（重要）
 
-**`analyze-video` 单条视频需要 2-5 分钟**（Whisper 模型加载 15-30s + 语音转录 30-120s + OCR 5-15s + 摘要 5-10s）。
+默认配置针对 **2-5 分钟内的稳定分析** 优化：
+- **Whisper 模型**: 默认 `tiny`（加载 ~5s，转录比 `base` 快 5 倍），需要更精准可改为 `base`
+- **最长转录**: 默认只转录前 300 秒（5 分钟）音频，长视频自动截断
+- **典型耗时**: 短视频 30-60s，中等视频 60-120s
 
-> **执行要求**：运行 `analyze-video` 时，终端 timeout 必须设置为 **300 秒（5分钟）以上**。如果终端环境硬限制 60 秒，请改用下方 `crawl-*` 命令或 `--step` 分段模式。
+> **执行要求**：运行 `analyze-video` 时，终端 timeout 设置为 **180 秒（3分钟）** 即可覆盖绝大多数视频。长视频（>10分钟）如需完整转录，用 `--max-duration 0` 并设置更长 timeout。
+
+```bash
+# 默认：tiny 模型 + 前 5 分钟音频（推荐，60-120s 完成）
+python scripts/xhs.py analyze-video <note_id>
+
+# 需要更高精度（耗时翻倍）
+python scripts/xhs.py analyze-video <note_id> --whisper-model base
+
+# 长视频完整转录（可能需要 5-10 分钟）
+python scripts/xhs.py analyze-video <note_id> --max-duration 0 --whisper-model base
+```
 
 **推荐方式一：crawl 命令（不受终端 timeout 限制）**
 

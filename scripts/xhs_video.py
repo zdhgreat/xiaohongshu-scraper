@@ -36,11 +36,13 @@ MEDIA_DIR = DATA / "media"
 DEFAULT_CONFIG: dict[str, Any] = {
     "enabled": False,
     "summary_mode": "none",       # none / ollama / openai / local / mcp
-    "whisper_model": "base",       # base / small / medium / large-v3
-    "frame_interval": 5,           # 关键帧间隔（秒）
+    "whisper_model": "tiny",      # tiny(base快5倍) / base / small / medium / large-v3
+    "whisper_beam_size": 3,       # 降低 beam_size 加速（默认5→3，精度略降）
+    "max_transcribe_seconds": 300, # 最多转录前 N 秒音频（0=不限制）
+    "frame_interval": 5,          # 关键帧间隔（秒）
     "openai_api_key": "",
     "openai_model": "gpt-4o-mini",
-    "openai_base_url": "",         # 留空用官方，可填兼容端点
+    "openai_base_url": "",        # 留空用官方，可填兼容端点
     "ollama_url": "http://localhost:11434",
     "ollama_model": "qwen2.5:7b",
 }
@@ -120,14 +122,26 @@ def has_jieba() -> bool:
 # Audio extraction
 # ----------------------------------------------------------------
 
-def extract_audio(video_path: Path, output_path: Path | None = None) -> Path:
-    """用 ffmpeg 从视频中提取音频（16kHz mono WAV，whisper 最优格式）。"""
+def extract_audio(
+    video_path: Path,
+    output_path: Path | None = None,
+    max_seconds: float = 0,
+) -> Path:
+    """用 ffmpeg 从视频中提取音频（16kHz mono WAV，whisper 最优格式）。
+
+    max_seconds: > 0 时只提取前 N 秒音频，避免长视频生成巨大 WAV。
+    """
     if not has_ffmpeg():
         raise RuntimeError("ffmpeg 未安装。安装: brew install ffmpeg / sudo apt install ffmpeg / winget install Gyan.FFmpeg")
     if output_path is None:
         output_path = video_path.with_suffix(".wav")
     cmd = [
         "ffmpeg", "-y", "-i", str(video_path),
+    ]
+    if max_seconds > 0:
+        cmd += ["-t", str(max_seconds)]
+        _msg(f"截取前 {max_seconds:.0f}s 音频")
+    cmd += [
         "-vn",                   # 不要视频流
         "-acodec", "pcm_s16le",  # 16-bit PCM
         "-ar", "16000",          # 16kHz 采样率
@@ -160,15 +174,15 @@ def _get_whisper_model(model_size: str = "base"):
     return model
 
 
-def transcribe(audio_path: Path, model_size: str = "base") -> dict[str, Any]:
+def transcribe(audio_path: Path, model_size: str = "tiny", beam_size: int = 3) -> dict[str, Any]:
     """转录音频，返回 {text: str, segments: [{start, end, text}], duration: float}。"""
     model = _get_whisper_model(model_size)
 
-    _msg("转录中...")
+    _msg(f"转录中（模型 {model_size}，beam {beam_size}）...")
     segments_iter, info = model.transcribe(
         str(audio_path),
         language="zh",        # 中文优先，自动检测也可
-        beam_size=5,
+        beam_size=beam_size,
         vad_filter=True,      # 过滤静音段
     )
 
@@ -568,10 +582,12 @@ def analyze_video(
 
     # 1. 提取音频 + 关键帧（extract 步骤）
     if all_steps or "extract" in steps:
+        max_sec = cfg.get("max_transcribe_seconds", 300)
         if has_ffmpeg():
             try:
                 _msg("提取音频...")
-                extract_audio(video_path, output_path=audio_cache)
+                extract_audio(video_path, output_path=audio_cache,
+                              max_seconds=max_sec if max_sec > 0 else 0)
                 _msg(f"音频已缓存: {audio_cache}")
             except Exception as e:
                 _msg(f"音频提取失败: {e}")
@@ -591,7 +607,11 @@ def analyze_video(
     if all_steps or "transcribe" in steps:
         if audio_cache.exists() and has_whisper():
             try:
-                whisper_result = transcribe(audio_cache, cfg.get("whisper_model", "base"))
+                whisper_result = transcribe(
+                    audio_cache,
+                    model_size=cfg.get("whisper_model", "tiny"),
+                    beam_size=cfg.get("whisper_beam_size", 3),
+                )
                 result["transcript"] = whisper_result["text"]
                 result["segments"] = whisper_result["segments"]
                 result["audio_duration"] = whisper_result["duration"]
@@ -731,6 +751,8 @@ def cmd_analyze_video(args) -> int:
             cfg["whisper_model"] = args.whisper_model
         if args.frame_interval:
             cfg["frame_interval"] = args.frame_interval
+        if hasattr(args, "max_duration") and args.max_duration is not None:
+            cfg["max_transcribe_seconds"] = args.max_duration
 
         # 解析 --step 参数
         steps = None
