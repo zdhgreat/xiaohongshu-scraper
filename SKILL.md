@@ -1,7 +1,7 @@
 ---
 name: xiaohongshu-scraper
 description: 抓取小红书（RedNote/Little Red Book/XHS）笔记、用户主页、关键词搜索结果，落库 SQLite 并导出 Markdown / CSV（飞书多维表格格式）。在用户提到"爬小红书"、"采集小红书笔记"、"抓 xhs"、"分析小红书数据"、"导出小红书到飞书"、"备份我喜欢的小红书博主"、"收集某关键词下的小红书内容"等场景时调用。三档签名（playwright/embed-js/py-port）+ 三档登录（rookiepy/QR/手动）+ 浏览器接管 的纵深防御架构，应对小红书强反爬。
-version: "1.5.0"
+version: "1.6.0"
 author: zhudonghai
 type: skill
 tags:
