@@ -134,8 +134,17 @@ def connect() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    # WAL 模式允许读写并发，大幅减少 "database is locked"
-    conn.execute("PRAGMA journal_mode=WAL")
+    # busy_timeout: 写冲突时最多等 10 秒，避免立刻抛 "database is locked"
+    conn.execute("PRAGMA busy_timeout = 10000")
+    # WAL 模式允许读写并发；先查再设，避免重复执行
+    jm = conn.execute("PRAGMA journal_mode").fetchone()
+    if jm is None or jm[0] != "wal":
+        conn.execute("PRAGMA journal_mode=WAL")
+    # 若上次进程异常退出，WAL 可能残留；尝试 checkpoint 清理
+    try:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    except Exception:
+        pass
     conn.executescript(SCHEMA)
     _migrate(conn)
     return conn

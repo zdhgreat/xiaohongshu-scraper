@@ -16,6 +16,8 @@ import argparse
 import io
 import json
 import sys
+import threading
+import time
 import traceback
 from pathlib import Path
 
@@ -44,6 +46,28 @@ from xhs_analyze import cmd_analyze
 from xhs_bootstrap import cmd_setup, cmd_setup_wizard
 from xhs_image import cmd_analyze_images, cmd_setup_image
 from xhs_video import cmd_analyze_video, cmd_setup_video
+
+
+# ---------------------------------------------------------------------------
+# 心跳线程：防止HTTP连接静默超时
+# ---------------------------------------------------------------------------
+
+class _Heartbeat:
+    """后台守护线程，定期输出到stderr防止HTTP连接被服务端判定为静默。
+    适用于 Kimi/国产API 等 60s 静默超时的场景。"""
+    def __init__(self, interval: float = 15.0):
+        self.interval = interval
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        while not self._stop.wait(self.interval):
+            print("[heartbeat] 任务仍在运行...", file=sys.stderr, flush=True)
+
+    def stop(self):
+        self._stop.set()
+        self._thread.join(timeout=1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -309,156 +333,169 @@ def cmd_note(args: argparse.Namespace) -> int:
 
 
 def cmd_user(args: argparse.Namespace) -> int:
-    with fetch_session(args) as (fetcher, conn):
-        info = fetch_user_info(fetcher, args.user_id)
-        if info:
-            info["user_id"] = args.user_id
-            xhs_storage.upsert_user(conn, _normalize_user(info))
-            conn.commit()
-            nickname = info.get('nickname', '')
-            fans = info.get('fans', '?')
-            print(f"[OK] 用户: {nickname}（粉丝 {fans}）")
+    hb = _Heartbeat()
+    try:
+        with fetch_session(args) as (fetcher, conn):
+            info = fetch_user_info(fetcher, args.user_id)
+            if info:
+                info["user_id"] = args.user_id
+                xhs_storage.upsert_user(conn, _normalize_user(info))
+                conn.commit()
+                nickname = info.get('nickname', '')
+                fans = info.get('fans', '?')
+                print(f"[OK] 用户: {nickname}（粉丝 {fans}）")
 
-        cursor = ""
-        total = 0
-        for page in range(1, args.pages + 1):
-            data = fetch_user_notes(fetcher, args.user_id, cursor=cursor)
-            items = data.get("notes") or []
-            if not items:
-                break
-            for item in items:
-                # user_posted 接口的 token 来源
-                item.setdefault("xsec_source", "pc_user")
-                note = _normalize_note({"id": item.get("note_id") or item.get("id"),
-                                        "xsec_token": item.get("xsec_token", ""),
-                                        "xsec_source": "pc_user",
-                                        "note_card": item})
-                if not note["note_id"]:
-                    continue
-                note["user_id"] = args.user_id
-                xhs_storage.upsert_note(conn, note)
-                _try_upsert_user_from_note(note, conn)
-                total += 1
-                token_mark = "Y" if note.get("xsec_token") else "N"
-                tag = _type_tag(note)
-                preview = _desc_preview(note)
-                print(f"  [{total}] [{tag}] {note['note_id']} token={token_mark} {preview}")
-                # --download / --analyze 后处理
-                xhs_media.post_process_note(note, conn, args)
-            conn.commit()
-            cursor = data.get("cursor", "")
-            if not data.get("has_more"):
-                break
-        nickname = info.get('nickname', '') if info else ''
-        label = f"《{nickname}》" if nickname else args.user_id
-        print(f"[OK] {label} 共入库 {total} 条笔记")
-        return 0
+            cursor = ""
+            total = 0
+            for page in range(1, args.pages + 1):
+                data = fetch_user_notes(fetcher, args.user_id, cursor=cursor)
+                items = data.get("notes") or []
+                if not items:
+                    break
+                for item in items:
+                    # user_posted 接口的 token 来源
+                    item.setdefault("xsec_source", "pc_user")
+                    note = _normalize_note({"id": item.get("note_id") or item.get("id"),
+                                            "xsec_token": item.get("xsec_token", ""),
+                                            "xsec_source": "pc_user",
+                                            "note_card": item})
+                    if not note["note_id"]:
+                        continue
+                    note["user_id"] = args.user_id
+                    xhs_storage.upsert_note(conn, note)
+                    _try_upsert_user_from_note(note, conn)
+                    total += 1
+                    token_mark = "Y" if note.get("xsec_token") else "N"
+                    tag = _type_tag(note)
+                    preview = _desc_preview(note)
+                    print(f"  [{total}] [{tag}] {note['note_id']} token={token_mark} {preview}")
+                    # --download / --analyze 后处理
+                    xhs_media.post_process_note(note, conn, args)
+                conn.commit()
+                cursor = data.get("cursor", "")
+                if not data.get("has_more"):
+                    break
+            nickname = info.get('nickname', '') if info else ''
+            label = f"《{nickname}》" if nickname else args.user_id
+            print(f"[OK] {label} 共入库 {total} 条笔记")
+            return 0
+    finally:
+        hb.stop()
 
 
 def cmd_search(args: argparse.Namespace) -> int:
-    with fetch_session(args) as (fetcher, conn):
-        total = 0
-        for page in range(1, args.pages + 1):
-            data = fetch_search(fetcher, args.keyword, page=page)
-            items = data.get("items") or []
-            if not items:
-                break
-            note_ids: list[str] = []
-            for item in items:
-                if item.get("model_type") != "note":
-                    continue
-                # 标记 xsec_source（search 接口的 token 来源是 pc_search）
-                item.setdefault("xsec_source", "pc_search")
-                note = _normalize_note(item)
-                if not note["note_id"]:
-                    continue
-                xhs_storage.upsert_note(conn, note)
-                _try_upsert_user_from_note(note, conn)
-                note_ids.append(note["note_id"])
-                total += 1
-                token_mark = "Y" if note.get("xsec_token") else "N"
-                tag = _type_tag(note)
-                preview = _desc_preview(note)
-                print(f"  [{total}] [{tag}] {note['note_id']} token={token_mark} {preview}")
-                # --download / --analyze 后处理
-                xhs_media.post_process_note(note, conn, args)
-            xhs_storage.save_search_page(conn, args.keyword, page, note_ids)
-            conn.commit()
-            if not data.get("has_more"):
-                break
-        print(f"[OK] 关键词「{args.keyword}」共入库 {total} 条笔记")
-        return 0
+    hb = _Heartbeat()
+    try:
+        with fetch_session(args) as (fetcher, conn):
+            total = 0
+            for page in range(1, args.pages + 1):
+                data = fetch_search(fetcher, args.keyword, page=page)
+                items = data.get("items") or []
+                if not items:
+                    break
+                note_ids: list[str] = []
+                for item in items:
+                    if item.get("model_type") != "note":
+                        continue
+                    # 标记 xsec_source（search 接口的 token 来源是 pc_search）
+                    item.setdefault("xsec_source", "pc_search")
+                    note = _normalize_note(item)
+                    if not note["note_id"]:
+                        continue
+                    xhs_storage.upsert_note(conn, note)
+                    _try_upsert_user_from_note(note, conn)
+                    note_ids.append(note["note_id"])
+                    total += 1
+                    token_mark = "Y" if note.get("xsec_token") else "N"
+                    tag = _type_tag(note)
+                    preview = _desc_preview(note)
+                    print(f"  [{total}] [{tag}] {note['note_id']} token={token_mark} {preview}")
+                    # --download / --analyze 后处理
+                    xhs_media.post_process_note(note, conn, args)
+                xhs_storage.save_search_page(conn, args.keyword, page, note_ids)
+                conn.commit()
+                if not data.get("has_more"):
+                    break
+            print(f"[OK] 关键词「{args.keyword}」共入库 {total} 条笔记")
+            return 0
+    finally:
+        hb.stop()
 
 
 def cmd_comments(args: argparse.Namespace) -> int:
     """抓某笔记的评论树。会复用 DB 里存的 xsec_token。"""
-    with fetch_session(args) as (fetcher, conn):
-        row = xhs_storage.get_note(conn, args.note_id)
-        if not row:
-            print(f"[ERR] 笔记 {args.note_id} 不在 DB，请先跑 note/search 入库", file=sys.stderr)
-            return 1
-        xsec_token = row["xsec_token"] or ""
-        if not xsec_token:
-            print(f"[ERR] 笔记 {args.note_id} 缺 xsec_token", file=sys.stderr)
-            return 1
+    hb = _Heartbeat()
+    try:
+        with fetch_session(args) as (fetcher, conn):
+            row = xhs_storage.get_note(conn, args.note_id)
+            if not row:
+                print(f"[ERR] 笔记 {args.note_id} 不在 DB，请先跑 note/search 入库", file=sys.stderr)
+                return 1
+            xsec_token = row["xsec_token"] or ""
+            if not xsec_token:
+                print(f"[ERR] 笔记 {args.note_id} 缺 xsec_token", file=sys.stderr)
+                return 1
 
-        # 1) 主评论分页
-        cursor = ""
-        main_count = 0
-        sub_count = 0
-        max_pages = args.max_pages
-        for page in range(1, max_pages + 1):
-            data = fetch_comments(fetcher, args.note_id, xsec_token, cursor=cursor)
-            comments = data.get("comments") or []
-            if not comments:
-                break
-            for c in comments:
-                norm = _normalize_comment(c, args.note_id)
-                if not norm["comment_id"]:
-                    continue
-                xhs_storage.upsert_comment(conn, norm)
-                main_count += 1
-                # 内联的 sub_comments
-                for sc in (c.get("sub_comments") or []):
-                    sn = _normalize_comment(sc, args.note_id, parent_id=norm["comment_id"])
-                    if sn["comment_id"]:
-                        xhs_storage.upsert_comment(conn, sn)
-                        sub_count += 1
-                # 还有更多子评论 → 分页拉
-                if c.get("sub_comment_has_more") and args.with_sub:
-                    sub_cursor = c.get("sub_comment_cursor", "")
-                    sub_pages = 0
-                    while sub_cursor and sub_pages < args.max_sub_pages:
-                        sub_data = fetch_sub_comments(
-                            fetcher, args.note_id, norm["comment_id"], xsec_token,
-                            cursor=sub_cursor,
-                        )
-                        subs = sub_data.get("comments") or []
-                        if not subs:
-                            break
-                        for sc in subs:
-                            sn = _normalize_comment(sc, args.note_id, parent_id=norm["comment_id"])
-                            if sn["comment_id"]:
-                                xhs_storage.upsert_comment(conn, sn)
-                                sub_count += 1
-                        sub_cursor = sub_data.get("cursor", "")
-                        if not sub_data.get("has_more"):
-                            break
-                        sub_pages += 1
-            print(f"  [page {page}] +{len(comments)} 主, 累计 {main_count}/{sub_count} 主/子",
-                  file=sys.stderr)
-            conn.commit()
-            cursor = data.get("cursor", "")
-            if not data.get("has_more") or not cursor:
-                break
+            # 1) 主评论分页
+            cursor = ""
+            main_count = 0
+            sub_count = 0
+            max_pages = args.max_pages
+            for page in range(1, max_pages + 1):
+                data = fetch_comments(fetcher, args.note_id, xsec_token, cursor=cursor)
+                comments = data.get("comments") or []
+                if not comments:
+                    break
+                for c in comments:
+                    norm = _normalize_comment(c, args.note_id)
+                    if not norm["comment_id"]:
+                        continue
+                    xhs_storage.upsert_comment(conn, norm)
+                    main_count += 1
+                    # 内联的 sub_comments
+                    for sc in (c.get("sub_comments") or []):
+                        sn = _normalize_comment(sc, args.note_id, parent_id=norm["comment_id"])
+                        if sn["comment_id"]:
+                            xhs_storage.upsert_comment(conn, sn)
+                            sub_count += 1
+                    # 还有更多子评论 → 分页拉
+                    if c.get("sub_comment_has_more") and args.with_sub:
+                        sub_cursor = c.get("sub_comment_cursor", "")
+                        sub_pages = 0
+                        while sub_cursor and sub_pages < args.max_sub_pages:
+                            sub_data = fetch_sub_comments(
+                                fetcher, args.note_id, norm["comment_id"], xsec_token,
+                                cursor=sub_cursor,
+                            )
+                            subs = sub_data.get("comments") or []
+                            if not subs:
+                                break
+                            for sc in subs:
+                                sn = _normalize_comment(sc, args.note_id, parent_id=norm["comment_id"])
+                                if sn["comment_id"]:
+                                    xhs_storage.upsert_comment(conn, sn)
+                                    sub_count += 1
+                            sub_cursor = sub_data.get("cursor", "")
+                            if not sub_data.get("has_more"):
+                                break
+                            sub_pages += 1
+                print(f"  [page {page}] +{len(comments)} 主, 累计 {main_count}/{sub_count} 主/子",
+                      file=sys.stderr)
+                conn.commit()   # 每页结束立即提交，缩短事务时间
+                cursor = data.get("cursor", "")
+                if not data.get("has_more") or not cursor:
+                    break
 
-        print(f"[OK] 笔记 {args.note_id}: {main_count} 主评论 + {sub_count} 子评论入库")
-        # 重新渲染 MD（带评论区）
-        title = row["title"] or "(无标题)"
-        path = xhs_storage.write_markdown(conn, args.note_id)
-        print(f"     《{title}》MD 已更新: 新增 {main_count} 主评论 + {sub_count} 子评论")
-        print(f"     文件: {path}")
-        return 0
+            conn.commit()  # 最终确保所有数据落盘
+            print(f"[OK] 笔记 {args.note_id}: {main_count} 主评论 + {sub_count} 子评论入库")
+            # 重新渲染 MD（带评论区）
+            title = row["title"] or "(无标题)"
+            path = xhs_storage.write_markdown(conn, args.note_id)
+            print(f"     《{title}》MD 已更新: 新增 {main_count} 主评论 + {sub_count} 子评论")
+            print(f"     文件: {path}")
+            return 0
+    finally:
+        hb.stop()
 
 
 def cmd_health(args: argparse.Namespace) -> int:
@@ -675,52 +712,56 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
 
 def cmd_refresh(args: argparse.Namespace) -> int:
     """重抓超过 N 小时的笔记（增量更新）。"""
-    with fetch_session(args) as (fetcher, conn):
-        cutoff = (datetime.now(timezone.utc) - timedelta(hours=args.max_age_hours)).strftime("%Y-%m-%d %H:%M:%S")
-        rows = conn.execute(
-            "SELECT note_id, xsec_token, xsec_source FROM notes "
-            "WHERE crawled_at < ? ORDER BY crawled_at ASC LIMIT ?",
-            (cutoff, args.limit),
-        ).fetchall()
-        if not rows:
-            print(f"[OK] 没有 {args.max_age_hours} 小时前的旧笔记需要刷新")
+    hb = _Heartbeat()
+    try:
+        with fetch_session(args) as (fetcher, conn):
+            cutoff = (datetime.now(timezone.utc) - timedelta(hours=args.max_age_hours)).strftime("%Y-%m-%d %H:%M:%S")
+            rows = conn.execute(
+                "SELECT note_id, xsec_token, xsec_source FROM notes "
+                "WHERE crawled_at < ? ORDER BY crawled_at ASC LIMIT ?",
+                (cutoff, args.limit),
+            ).fetchall()
+            if not rows:
+                print(f"[OK] 没有 {args.max_age_hours} 小时前的旧笔记需要刷新")
+                return 0
+            print(f"[REFRESH] 找到 {len(rows)} 条超过 {args.max_age_hours}h 的旧笔记", file=sys.stderr)
+            updated = 0
+            skipped = 0
+            for row in rows:
+                note_id = row["note_id"]
+                xsec_token = row["xsec_token"] or ""
+                xsec_source = row["xsec_source"] or "pc_search"
+                try:
+                    item = fetch_note_detail(fetcher, note_id, xsec_token=xsec_token, xsec_source=xsec_source)
+                    note = _normalize_note(item)
+                    note["note_id"] = note_id
+                    if not note.get("xsec_token") and xsec_token:
+                        note["xsec_token"] = xsec_token
+                        note["xsec_source"] = xsec_source
+                    # 检查是否被跳过（content_hash 相同）
+                    old_hash = conn.execute(
+                        "SELECT content_hash FROM notes WHERE note_id = ?", (note_id,)
+                    ).fetchone()
+                    old_hash_val = old_hash["content_hash"] if old_hash else ""
+                    xhs_storage.upsert_note(conn, note)
+                    if note["user_id"]:
+                        user = (item.get("note_card") or {}).get("user") or {}
+                        user["user_id"] = note["user_id"]
+                        xhs_storage.upsert_user(conn, _normalize_user(user))
+                    conn.commit()
+                    if old_hash_val and old_hash_val == note.get("content_hash", ""):
+                        skipped += 1
+                        print(f"  [{updated + skipped}/{len(rows)}] {note_id} 未变更（跳过）")
+                    else:
+                        updated += 1
+                        title = note.get("title", "")[:40]
+                        print(f"  [{updated + skipped}/{len(rows)}] {note_id} 已更新: 《{title}》")
+                except Exception as e:
+                    print(f"  [{updated + skipped + 1}/{len(rows)}] {note_id} 失败: {e}", file=sys.stderr)
+            print(f"[OK] 刷新完成: {updated} 条更新, {skipped} 条未变更")
             return 0
-        print(f"[REFRESH] 找到 {len(rows)} 条超过 {args.max_age_hours}h 的旧笔记", file=sys.stderr)
-        updated = 0
-        skipped = 0
-        for row in rows:
-            note_id = row["note_id"]
-            xsec_token = row["xsec_token"] or ""
-            xsec_source = row["xsec_source"] or "pc_search"
-            try:
-                item = fetch_note_detail(fetcher, note_id, xsec_token=xsec_token, xsec_source=xsec_source)
-                note = _normalize_note(item)
-                note["note_id"] = note_id
-                if not note.get("xsec_token") and xsec_token:
-                    note["xsec_token"] = xsec_token
-                    note["xsec_source"] = xsec_source
-                # 检查是否被跳过（content_hash 相同）
-                old_hash = conn.execute(
-                    "SELECT content_hash FROM notes WHERE note_id = ?", (note_id,)
-                ).fetchone()
-                old_hash_val = old_hash["content_hash"] if old_hash else ""
-                xhs_storage.upsert_note(conn, note)
-                if note["user_id"]:
-                    user = (item.get("note_card") or {}).get("user") or {}
-                    user["user_id"] = note["user_id"]
-                    xhs_storage.upsert_user(conn, _normalize_user(user))
-                conn.commit()
-                if old_hash_val and old_hash_val == note.get("content_hash", ""):
-                    skipped += 1
-                    print(f"  [{updated + skipped}/{len(rows)}] {note_id} 未变更（跳过）")
-                else:
-                    updated += 1
-                    title = note.get("title", "")[:40]
-                    print(f"  [{updated + skipped}/{len(rows)}] {note_id} 已更新: 《{title}》")
-            except Exception as e:
-                print(f"  [{updated + skipped + 1}/{len(rows)}] {note_id} 失败: {e}", file=sys.stderr)
-        print(f"[OK] 刷新完成: {updated} 条更新, {skipped} 条未变更")
-        return 0
+    finally:
+        hb.stop()
 
 
 def cmd_export(args: argparse.Namespace) -> int:
@@ -766,201 +807,219 @@ def cmd_export(args: argparse.Namespace) -> int:
 
 def cmd_feed(args: argparse.Namespace) -> int:
     """推荐流 / 分类流浏览，每页入库并打印摘要。"""
-    with fetch_session(args) as (fetcher, conn):
-        category_key = getattr(args, "category", "recommend")
-        category = xhs_config.FEED_CATEGORIES.get(category_key, "homefeed_recommend")
-        total = 0
-        cursor_score = ""
-        for page in range(1, args.pages + 1):
-            data = fetch_feed(fetcher, category=category, cursor_score=cursor_score, num=args.num)
-            items = data.get("items") or []
-            if not items:
-                print(f"  [page {page}] 空结果，结束", file=sys.stderr)
-                break
-            for item in items:
-                if item.get("model_type") != "note":
-                    continue
-                note = _normalize_note(item)
-                if not note["note_id"]:
-                    continue
-                xhs_storage.upsert_note(conn, note)
-                _try_upsert_user_from_note(note, conn)
-                total += 1
-                tag = _type_tag(note)
-                preview = _desc_preview(note)
-                print(f"  [{total}] [{tag}] {note['note_id']} {preview}")
-            conn.commit()
-            cursor_score = data.get("cursor_score", "")
-            if not data.get("has_more"):
-                break
-        print(f"[OK] feed ({category_key}) 共入库 {total} 条")
-        return 0
+    hb = _Heartbeat()
+    try:
+        with fetch_session(args) as (fetcher, conn):
+            category_key = getattr(args, "category", "recommend")
+            category = xhs_config.FEED_CATEGORIES.get(category_key, "homefeed_recommend")
+            total = 0
+            cursor_score = ""
+            for page in range(1, args.pages + 1):
+                data = fetch_feed(fetcher, category=category, cursor_score=cursor_score, num=args.num)
+                items = data.get("items") or []
+                if not items:
+                    print(f"  [page {page}] 空结果，结束", file=sys.stderr)
+                    break
+                for item in items:
+                    if item.get("model_type") != "note":
+                        continue
+                    note = _normalize_note(item)
+                    if not note["note_id"]:
+                        continue
+                    xhs_storage.upsert_note(conn, note)
+                    _try_upsert_user_from_note(note, conn)
+                    total += 1
+                    tag = _type_tag(note)
+                    preview = _desc_preview(note)
+                    print(f"  [{total}] [{tag}] {note['note_id']} {preview}")
+                conn.commit()
+                cursor_score = data.get("cursor_score", "")
+                if not data.get("has_more"):
+                    break
+            print(f"[OK] feed ({category_key}) 共入库 {total} 条")
+            return 0
+    finally:
+        hb.stop()
 
 
 def cmd_crawl_feed(args: argparse.Namespace) -> int:
     """长任务版 feed：cursor 落库 + --resume 续抓。"""
-    with fetch_session(args) as (fetcher, conn):
-        category_key = getattr(args, "category", "recommend")
-        category = xhs_config.FEED_CATEGORIES.get(category_key, "homefeed_recommend")
-        task_id = f"feed:{category_key}"
-        cursor_score = ""
-        start_page = 1
-        if args.resume:
-            st = xhs_storage.get_crawl_state(conn, task_id)
-            if st:
-                cursor_score = st["cursor"] or ""
-                print(f"[RESUME] 从 cursor={cursor_score[:30]} 继续", file=sys.stderr)
+    hb = _Heartbeat()
+    try:
+        with fetch_session(args) as (fetcher, conn):
+            category_key = getattr(args, "category", "recommend")
+            category = xhs_config.FEED_CATEGORIES.get(category_key, "homefeed_recommend")
+            task_id = f"feed:{category_key}"
+            cursor_score = ""
+            start_page = 1
+            if args.resume:
+                st = xhs_storage.get_crawl_state(conn, task_id)
+                if st:
+                    cursor_score = st["cursor"] or ""
+                    print(f"[RESUME] 从 cursor={cursor_score[:30]} 继续", file=sys.stderr)
 
-        total = 0
-        try:
-            for page in range(start_page, args.max_pages + 1):
-                data = fetch_feed(fetcher, category=category, cursor_score=cursor_score)
-                items = data.get("items") or []
-                if not items:
-                    print(f"  [page {page}] 空结果，结束", file=sys.stderr)
-                    break
-                page_count = 0
-                for item in items:
-                    if item.get("model_type") != "note":
-                        continue
-                    note = _normalize_note(item)
-                    if not note["note_id"]:
-                        continue
-                    xhs_storage.upsert_note(conn, note)
-                    _try_upsert_user_from_note(note, conn)
-                    total += 1
-                    page_count += 1
-                    xhs_media.post_process_note(note, conn, args)
-                conn.commit()
-                cursor_score = data.get("cursor_score", "")
+            total = 0
+            try:
+                for page in range(start_page, args.max_pages + 1):
+                    data = fetch_feed(fetcher, category=category, cursor_score=cursor_score)
+                    items = data.get("items") or []
+                    if not items:
+                        print(f"  [page {page}] 空结果，结束", file=sys.stderr)
+                        break
+                    page_count = 0
+                    for item in items:
+                        if item.get("model_type") != "note":
+                            continue
+                        note = _normalize_note(item)
+                        if not note["note_id"]:
+                            continue
+                        xhs_storage.upsert_note(conn, note)
+                        _try_upsert_user_from_note(note, conn)
+                        total += 1
+                        page_count += 1
+                        xhs_media.post_process_note(note, conn, args)
+                    conn.commit()
+                    cursor_score = data.get("cursor_score", "")
+                    xhs_storage.update_crawl_state(
+                        conn, task_id, "feed", category_key,
+                        cursor_score, "running", "",
+                    )
+                    print(f"  [page {page}] +{page_count} 入库，累计 {total}", file=sys.stderr)
+                    if not data.get("has_more") or not cursor_score:
+                        print("  has_more=False 或 cursor 为空，结束", file=sys.stderr)
+                        break
                 xhs_storage.update_crawl_state(
                     conn, task_id, "feed", category_key,
-                    cursor_score, "running", "",
+                    cursor_score, "completed", "",
                 )
-                print(f"  [page {page}] +{page_count} 入库，累计 {total}", file=sys.stderr)
-                if not data.get("has_more") or not cursor_score:
-                    print("  has_more=False 或 cursor 为空，结束", file=sys.stderr)
-                    break
-            xhs_storage.update_crawl_state(
-                conn, task_id, "feed", category_key,
-                cursor_score, "completed", "",
-            )
-            print(f"[OK] crawl-feed ({category_key}) 完成：{total} 条新增")
-            return 0
-        except FatalRiskError as e:
-            xhs_storage.update_crawl_state(
-                conn, task_id, "feed", category_key,
-                cursor_score, "paused", str(e),
-            )
-            print(f"[PAUSED] 因风控暂停：{e}\n下次用 --resume 继续。", file=sys.stderr)
-            return 2
+                print(f"[OK] crawl-feed ({category_key}) 完成：{total} 条新增")
+                return 0
+            except FatalRiskError as e:
+                xhs_storage.update_crawl_state(
+                    conn, task_id, "feed", category_key,
+                    cursor_score, "paused", str(e),
+                )
+                print(f"[PAUSED] 因风控暂停：{e}\n下次用 --resume 继续。", file=sys.stderr)
+                return 2
+    finally:
+        hb.stop()
 
 
 def cmd_download(args: argparse.Namespace) -> int:
     """下载某笔记的图片/视频到 data/media/<note_id>/。不需要签名（直接从 CDN 拉）。"""
-    conn = xhs_storage.connect()
+    hb = _Heartbeat()
     try:
-        row = xhs_storage.get_note(conn, args.note_id)
-        if not row:
-            print(f"[ERR] 笔记 {args.note_id} 不在 DB", file=sys.stderr)
-            return 1
-
-        title = row["title"] or "(无标题)"
-        with_video = getattr(args, "with_video", True)
-        overwrite = getattr(args, "overwrite", False)
-        n_ok, n_video, n_err, out = xhs_media.download_media(
-            args.note_id, conn, with_video=with_video, overwrite=overwrite
-        )
-
-        rel = out.relative_to(xhs_config.MEDIA_DIR)
-        print(f"[OK] 《{title}》媒体下载完成")
-        parts = []
-        if n_ok:
-            parts.append(f"{n_ok} 张图片")
-        if n_video:
-            parts.append("1 个视频")
-        if n_err:
-            parts.append(f"{n_err} 个失败")
-        if parts:
-            print(f"     结果: {'、'.join(parts)}")
-        print(f"     存放: media/{rel}")
-        # 重新渲染 MD（会自动用本地路径）
+        conn = xhs_storage.connect()
         try:
-            md = xhs_storage.write_markdown(conn, args.note_id)
-            print(f"     MD 已更新（图片/视频改用本地路径）: {md.name}")
-        except Exception:
-            pass
-        return 0 if n_err == 0 else 2
+            row = xhs_storage.get_note(conn, args.note_id)
+            if not row:
+                print(f"[ERR] 笔记 {args.note_id} 不在 DB", file=sys.stderr)
+                return 1
+
+            title = row["title"] or "(无标题)"
+            with_video = getattr(args, "with_video", True)
+            overwrite = getattr(args, "overwrite", False)
+            n_ok, n_video, n_err, out = xhs_media.download_media(
+                args.note_id, conn, with_video=with_video, overwrite=overwrite
+            )
+
+            rel = out.relative_to(xhs_config.MEDIA_DIR)
+            print(f"[OK] 《{title}》媒体下载完成")
+            parts = []
+            if n_ok:
+                parts.append(f"{n_ok} 张图片")
+            if n_video:
+                parts.append("1 个视频")
+            if n_err:
+                parts.append(f"{n_err} 个失败")
+            if parts:
+                print(f"     结果: {'、'.join(parts)}")
+            print(f"     存放: media/{rel}")
+            # 重新渲染 MD（会自动用本地路径）
+            try:
+                md = xhs_storage.write_markdown(conn, args.note_id)
+                print(f"     MD 已更新（图片/视频改用本地路径）: {md.name}")
+            except Exception:
+                pass
+            return 0 if n_err == 0 else 2
+        finally:
+            conn.close()
     finally:
-        conn.close()
+        hb.stop()
 
 
 def cmd_crawl_search(args: argparse.Namespace) -> int:
     """长任务版 search：多页 + cursor 落库 + --resume 续抓"""
-    with fetch_session(args) as (fetcher, conn):
-        task_id = f"search:{args.keyword}"
-        # 恢复
-        start_page = 1
-        if args.resume:
-            st = xhs_storage.get_crawl_state(conn, task_id)
-            if st:
-                start_page = int(st["cursor"] or "1")
-                print(f"[RESUME] 从第 {start_page} 页继续（上次状态：{st['status']}）", file=sys.stderr)
+    hb = _Heartbeat()
+    try:
+        with fetch_session(args) as (fetcher, conn):
+            task_id = f"search:{args.keyword}"
+            # 恢复
+            start_page = 1
+            if args.resume:
+                st = xhs_storage.get_crawl_state(conn, task_id)
+                if st:
+                    start_page = int(st["cursor"] or "1")
+                    print(f"[RESUME] 从第 {start_page} 页继续（上次状态：{st['status']}）", file=sys.stderr)
 
-        total = 0
-        last_page = start_page - 1
-        try:
-            for page in range(start_page, args.max_pages + 1):
-                data = fetch_search(fetcher, args.keyword, page=page)
-                items = data.get("items") or []
-                if not items:
-                    print(f"  [page {page}] 空结果，结束", file=sys.stderr)
-                    break
-                note_ids: list[str] = []
-                for item in items:
-                    if item.get("model_type") != "note":
-                        continue
-                    item.setdefault("xsec_source", "pc_search")
-                    note = _normalize_note(item)
-                    if not note["note_id"]:
-                        continue
-                    xhs_storage.upsert_note(conn, note)
-                    _try_upsert_user_from_note(note, conn)
-                    note_ids.append(note["note_id"])
-                    total += 1
-                    xhs_media.post_process_note(note, conn, args)
-                xhs_storage.save_search_page(conn, args.keyword, page, note_ids)
-                conn.commit()
-                last_page = page
+            total = 0
+            last_page = start_page - 1
+            try:
+                for page in range(start_page, args.max_pages + 1):
+                    data = fetch_search(fetcher, args.keyword, page=page)
+                    items = data.get("items") or []
+                    if not items:
+                        print(f"  [page {page}] 空结果，结束", file=sys.stderr)
+                        break
+                    note_ids: list[str] = []
+                    for item in items:
+                        if item.get("model_type") != "note":
+                            continue
+                        item.setdefault("xsec_source", "pc_search")
+                        note = _normalize_note(item)
+                        if not note["note_id"]:
+                            continue
+                        xhs_storage.upsert_note(conn, note)
+                        _try_upsert_user_from_note(note, conn)
+                        note_ids.append(note["note_id"])
+                        total += 1
+                        xhs_media.post_process_note(note, conn, args)
+                    xhs_storage.save_search_page(conn, args.keyword, page, note_ids)
+                    conn.commit()
+                    last_page = page
+                    xhs_storage.update_crawl_state(
+                        conn, task_id, "search", args.keyword,
+                        str(page + 1), "running", "",
+                    )
+                    print(f"  [page {page}] +{len(note_ids)} 入库，累计 {total}", file=sys.stderr)
+                    if not data.get("has_more"):
+                        print("  has_more=False，结束", file=sys.stderr)
+                        break
+                # cursor 保持 last_page + 1（下次 --resume 从这开始）
                 xhs_storage.update_crawl_state(
                     conn, task_id, "search", args.keyword,
-                    str(page + 1), "running", "",
+                    str(last_page + 1), "completed", "",
                 )
-                print(f"  [page {page}] +{len(note_ids)} 入库，累计 {total}", file=sys.stderr)
-                if not data.get("has_more"):
-                    print("  has_more=False，结束", file=sys.stderr)
-                    break
-            # cursor 保持 last_page + 1（下次 --resume 从这开始）
-            xhs_storage.update_crawl_state(
-                conn, task_id, "search", args.keyword,
-                str(last_page + 1), "completed", "",
-            )
-            print(f"[OK] crawl-search '{args.keyword}' 完成：{total} 条新增（下次 --resume 从 page {last_page + 1}）")
-            return 0
-        except FatalRiskError as e:
-            paused_page = page if 'page' in dir() else last_page + 1
-            xhs_storage.update_crawl_state(
-                conn, task_id, "search", args.keyword,
-                str(max(paused_page, last_page + 1)), "paused", str(e),
-            )
-            print(f"[PAUSED] 在第 {paused_page} 页因风控暂停：{e}\n下次用 --resume 继续。", file=sys.stderr)
-            return 2
+                print(f"[OK] crawl-search '{args.keyword}' 完成：{total} 条新增（下次 --resume 从 page {last_page + 1}）")
+                return 0
+            except FatalRiskError as e:
+                paused_page = page if 'page' in dir() else last_page + 1
+                xhs_storage.update_crawl_state(
+                    conn, task_id, "search", args.keyword,
+                    str(max(paused_page, last_page + 1)), "paused", str(e),
+                )
+                print(f"[PAUSED] 在第 {paused_page} 页因风控暂停：{e}\n下次用 --resume 继续。", file=sys.stderr)
+                return 2
+    finally:
+        hb.stop()
 
 
 def cmd_crawl_user(args: argparse.Namespace) -> int:
     """长任务版 user：cursor 落库 + --resume"""
-    with fetch_session(args) as (fetcher, conn):
-        task_id = f"user:{args.user_id}"
+    hb = _Heartbeat()
+    try:
+        with fetch_session(args) as (fetcher, conn):
+            task_id = f"user:{args.user_id}"
         cursor = ""
         if args.resume:
             st = xhs_storage.get_crawl_state(conn, task_id)
@@ -1021,6 +1080,8 @@ def cmd_crawl_user(args: argparse.Namespace) -> int:
             )
             print(f"[PAUSED] cursor={cursor[:30]} 因风控暂停：{e}\n下次用 --resume 继续。", file=sys.stderr)
             return 2
+    finally:
+        hb.stop()
 
 
 # ---------------------------------------------------------------------------

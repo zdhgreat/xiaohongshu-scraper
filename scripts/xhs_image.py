@@ -18,6 +18,7 @@ import base64
 import json
 import re
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -835,6 +836,23 @@ def _msg(text: str) -> None:
     print(f"[IMAGE] {text}", file=sys.stderr, flush=True)
 
 
+class _Heartbeat:
+    """后台守护线程，定期输出到 stderr 防止连接被静默 kill。"""
+    def __init__(self, interval: float = 15.0):
+        self.interval = interval
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        while not self._stop.wait(self.interval):
+            print("[heartbeat] 任务仍在运行...", file=sys.stderr, flush=True)
+
+    def stop(self):
+        self._stop.set()
+        self._thread.join(timeout=1.0)
+
+
 # ---------------------------------------------------------------------------
 # CLI command handlers (moved from xhs.py)
 # ---------------------------------------------------------------------------
@@ -843,6 +861,8 @@ def cmd_analyze_images(args) -> int:
     """对已入库的图文笔记做图片智能分析：OCR + AI 视觉描述 + Mermaid 图表。"""
     import xhs_storage
 
+    # 心跳：防止长耗时任务被 Kimi 2.6 等平台静默 kill
+    hb = _Heartbeat()
     conn = xhs_storage.connect()
     try:
         row = xhs_storage.get_note(conn, args.note_id)
@@ -958,6 +978,7 @@ def cmd_analyze_images(args) -> int:
         return 0
     finally:
         conn.close()
+        hb.stop()
 
 
 def cmd_setup_image(args) -> int:

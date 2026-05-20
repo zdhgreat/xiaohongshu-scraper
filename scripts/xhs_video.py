@@ -24,6 +24,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -148,7 +149,7 @@ def extract_audio(
         "-ac", "1",              # 单声道
         str(output_path),
     ]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     if r.returncode != 0:
         raise RuntimeError(f"ffmpeg 音频提取失败: {r.stderr[:200]}")
     return output_path
@@ -163,12 +164,12 @@ _whisper_cache: tuple[str, Any] | None = None
 
 
 def _get_whisper_model(model_size: str = "base"):
-    """获取或加载 Whisper 模型（带缓存）。"""
+    """获取或加载 Whisper 模型（带缓存，第一次加载约需 5–15 秒）。"""
     global _whisper_cache
     if _whisper_cache is not None and _whisper_cache[0] == model_size:
         return _whisper_cache[1]
     from faster_whisper import WhisperModel  # type: ignore
-    _msg(f"加载 Whisper 模型 ({model_size})...")
+    _msg(f"加载 Whisper 模型 ({model_size})... 第一次较慢，缓存后复用")
     model = WhisperModel(model_size, device="cpu", compute_type="int8")
     _whisper_cache = (model_size, model)
     return model
@@ -219,10 +220,10 @@ def extract_keyframes(video_path: Path, output_dir: Path, interval: int = 5) -> 
         pattern,
     ]
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     except subprocess.TimeoutExpired as proc:
         proc.kill()
-        _msg("关键帧提取超时（5分钟），使用已提取的帧")
+        _msg("关键帧提取超时，使用已提取的帧")
     else:
         if r.returncode != 0:
             _msg(f"关键帧提取警告: {r.stderr[:100]}")
@@ -678,6 +679,23 @@ def _msg(text: str) -> None:
     print(f"[VIDEO] {text}", file=sys.stderr, flush=True)
 
 
+class _Heartbeat:
+    """后台守护线程，定期输出到 stderr 防止连接被静默 kill。"""
+    def __init__(self, interval: float = 15.0):
+        self.interval = interval
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        while not self._stop.wait(self.interval):
+            print("[heartbeat] 任务仍在运行...", file=sys.stderr, flush=True)
+
+    def stop(self):
+        self._stop.set()
+        self._thread.join(timeout=1.0)
+
+
 def extract_video_cover(raw: dict) -> str:
     """从 raw_json 提取视频封面图 URL。"""
     video = raw.get("video") or {}
@@ -715,6 +733,8 @@ def cmd_analyze_video(args) -> int:
     import xhs_storage
     import xhs_media
 
+    # 心跳：防止长耗时任务被 Kimi 2.6 等平台静默 kill
+    hb = _Heartbeat()
     conn = xhs_storage.connect()
     try:
         row = xhs_storage.get_note(conn, args.note_id)
@@ -828,6 +848,7 @@ def cmd_analyze_video(args) -> int:
         return 0
     finally:
         conn.close()
+        hb.stop()
 
 
 def cmd_setup_video(args) -> int:
