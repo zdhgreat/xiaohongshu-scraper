@@ -1292,6 +1292,13 @@ def main(argv: list[str] | None = None) -> int:
         except Exception:
             pass
 
+    # 注册 SIGTERM：确保 PID 文件被清理
+    import signal
+    def _sigterm_handler(sig, frame):
+        xhs_storage._release_lock()
+        sys.exit(143)
+    signal.signal(signal.SIGTERM, _sigterm_handler)
+
     # 首次运行自动安装依赖（延迟到 main() 而非模块级，避免 import 副作用）
     xhs_bootstrap.ensure_ready()
 
@@ -1303,6 +1310,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[FATAL] {e}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:
+        xhs_storage._release_lock()
         print("\n[ABORT] 用户中断", file=sys.stderr)
         return 130
     except Exception as e:

@@ -246,7 +246,9 @@ python scripts/xhs.py analyze-video <note_id>
 > python scripts/xhs.py crawl-search "关键词" --max-pages 5
 > ```
 >
-> **注意**：以上命令含视频分析时，单条视频需要 2-5 分钟。执行时请设置充足 timeout（建议 600 秒以上），或使用 crawl 命令让 skill 内部调度。
+> **注意**：以上命令含视频分析时，单条视频需要 30-120 秒。执行时请设置充足 timeout（建议 600 秒以上），或使用 crawl 命令让 skill 内部调度。
+>
+> ⚠️ **串行执行原则**：所有命令共享同一个 SQLite 数据库，不支持同时运行。等上一个命令完全结束后再启动下一个。如果命令超时，skill 会自动检测并清理残留锁，无需手动干预。
 
 > **分析依赖**（未安装时自动降级为仅 OCR）：ffmpeg（视频音频提取）、faster-whisper（语音转文字）、rapidocr-onnxruntime（OCR）。即便依赖不完整，analyze 步骤也必须执行——至少会产出 OCR 结果。
 
@@ -428,7 +430,7 @@ python scripts/xhs.py analyze-video <video_note_id> --mode ollama
 - **最长转录**: 默认只转录前 300 秒（5 分钟）音频，长视频自动截断
 - **典型耗时**: 短视频 30-60s，中等视频 60-120s
 
-> **执行要求**：运行 `analyze-video` 时，终端 timeout 设置为 **180 秒（3分钟）** 即可覆盖绝大多数视频。长视频（>10分钟）如需完整转录，用 `--max-duration 0` 并设置更长 timeout。
+> **执行要求**：运行 `analyze-video` 时，终端 timeout 设置 **300 秒（5分钟）** 以覆盖绝大多数视频。长视频（>10分钟）如需完整转录，用 `--max-duration 0` 并设置更长 timeout。含 `--download` 的批量命令 timeout 建议 600 秒。
 
 ```bash
 # 默认：tiny 模型 + 前 5 分钟音频（推荐，60-120s 完成）
@@ -464,7 +466,7 @@ python scripts/xhs.py analyze-video <note_id>
 # 第1步：提取音频+关键帧（约 10-20s）
 python scripts/xhs.py analyze-video <note_id> --step extract
 
-# 第2步：语音转录（约 30-120s，设置 timeout>=180s）
+# 第2步：语音转录（约 30-120s，设置 timeout>=300s）
 python scripts/xhs.py analyze-video <note_id> --step transcribe
 
 # 第3步：OCR + 摘要（约 10-20s）

@@ -6,11 +6,14 @@ MVP 用 4 张表：notes / users / search_cache / crawl_state。
 
 from __future__ import annotations
 
+import atexit
 import csv
 import json
 import os
 import re
 import sqlite3
+import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -130,12 +133,83 @@ def _migrate(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+# ---------------------------------------------------------------------------
+# PID 文件锁：防止多个命令并发写入同一数据库
+# ---------------------------------------------------------------------------
+
+_PID_FILE = DB_PATH.with_suffix('.pid')
+
+
+def _check_stale_lock() -> None:
+    """检查并清理残留的数据库锁（来自上一个被 kill 的进程）。"""
+    if not _PID_FILE.exists():
+        return
+    try:
+        old_pid = int(_PID_FILE.read_text().strip())
+    except (ValueError, OSError):
+        _PID_FILE.unlink(missing_ok=True)
+        return
+    if _is_pid_alive(old_pid):
+        print(f"[DB] 另一个 xhs 进程 (PID {old_pid}) 正在使用数据库，等待释放...",
+              file=sys.stderr)
+    else:
+        # 进程已死 → 残留锁，自动清理
+        print(f"[DB] 清理残留锁（PID {old_pid} 已退出）", file=sys.stderr)
+        _PID_FILE.unlink(missing_ok=True)
+        time.sleep(1.0)  # 等 OS 释放文件锁
+
+
+def _is_pid_alive(pid: int) -> bool:
+    """跨平台检查进程是否存活。"""
+    if sys.platform == "win32":
+        # Windows: 用 ctypes OpenProcess 检查
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if handle:
+                kernel32.CloseHandle(handle)
+                return True
+            return False
+        except Exception:
+            # fallback: 假设存活（保守策略）
+            return True
+    else:
+        # Unix: os.kill(pid, 0) 检查
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True  # 进程存在但无权发信号
+
+
+def _register_lock() -> None:
+    """注册当前进程为数据库持有者。"""
+    _PID_FILE.write_text(str(os.getpid()))
+
+
+def _release_lock() -> None:
+    """释放数据库锁（当前进程是持有者时才删除）。"""
+    try:
+        current = int(_PID_FILE.read_text().strip())
+        if current == os.getpid():
+            _PID_FILE.unlink(missing_ok=True)
+    except (ValueError, OSError):
+        _PID_FILE.unlink(missing_ok=True)
+
+
 def connect() -> sqlite3.Connection:
+    # 1. 检查并清理残留锁（来自被 kill 的上一个进程）
+    _check_stale_lock()
+
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    # busy_timeout: 写冲突时最多等 10 秒，避免立刻抛 "database is locked"
-    conn.execute("PRAGMA busy_timeout = 10000")
+    # busy_timeout: 写冲突时最多等 30 秒，给残留进程更多释放时间
+    conn.execute("PRAGMA busy_timeout = 30000")
     # WAL 模式允许读写并发；先查再设，避免重复执行
     jm = conn.execute("PRAGMA journal_mode").fetchone()
     if jm is None or jm[0] != "wal":
@@ -145,8 +219,12 @@ def connect() -> sqlite3.Connection:
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     except Exception:
         pass
+    # 2. 注册当前进程为数据库持有者
+    _register_lock()
     conn.executescript(SCHEMA)
     _migrate(conn)
+    # 3. 注册 atexit 清理 PID 文件（进程正常退出或未捕获异常时触发）
+    atexit.register(_release_lock)
     return conn
 
 
