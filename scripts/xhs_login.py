@@ -212,7 +212,8 @@ def acquire_via_rookiepy() -> dict[str, str]:
 # 档位 2: Playwright QR
 # ---------------------------------------------------------------------------
 
-def acquire_via_playwright_qr(headless: bool = False, timeout_s: int = 240, profile_hint: str = "") -> dict[str, str]:
+def acquire_via_playwright_qr(headless: bool = False, timeout_s: int = 240,
+                               profile_hint: str = "", channel: str = "") -> dict[str, str]:
     try:
         from playwright.sync_api import sync_playwright  # type: ignore
     except ImportError as e:
@@ -224,13 +225,17 @@ def acquire_via_playwright_qr(headless: bool = False, timeout_s: int = 240, prof
     else:
         profile = DATA_DIR / "pw_profile"
     profile.mkdir(parents=True, exist_ok=True)
-    print("[LOGIN] 启动 Chromium，请扫码并在手机 App 上点确认登录...", file=sys.stderr)
+    browser_label = channel.title() if channel else "Chromium"
+    print(f"[LOGIN] 启动 {browser_label}，请扫码并在手机 App 上点确认登录...", file=sys.stderr)
     with sync_playwright() as pw:
-        browser = pw.chromium.launch_persistent_context(
-            user_data_dir=str(profile),
-            headless=headless,
-            args=["--disable-blink-features=AutomationControlled"],
-        )
+        launch_kwargs: dict[str, Any] = {
+            "user_data_dir": str(profile),
+            "headless": headless,
+            "args": ["--disable-blink-features=AutomationControlled"],
+        }
+        if channel:
+            launch_kwargs["channel"] = channel
+        browser = pw.chromium.launch_persistent_context(**launch_kwargs)
         try:
             page = browser.new_page()
             page.goto("https://www.xiaohongshu.com/explore", wait_until="domcontentloaded")
@@ -268,6 +273,77 @@ def acquire_via_playwright_qr(headless: bool = False, timeout_s: int = 240, prof
 
 
 # ---------------------------------------------------------------------------
+# 档位 2.5: Profile Session 恢复（headless，无需人工）
+# ---------------------------------------------------------------------------
+
+def acquire_via_profile_restore(alias: str, timeout_s: int = 30) -> dict[str, str]:
+    """利用 Playwright persistent profile 的 session 恢复能力获取 cookie。
+
+    与 acquire_via_playwright_qr 的区别：
+    - 完全 headless，不需要用户扫码
+    - 超时更短（30s vs 240s）
+    - 期望 profile 里已有有效 session
+
+    前提：该 alias 已经通过 QR 登录过一次，建立了 pw_profile_<alias>。
+    """
+    try:
+        from playwright.sync_api import sync_playwright  # type: ignore
+    except ImportError as e:
+        raise LoginError("缺少 playwright。pip install playwright && playwright install chromium") from e
+
+    from xhs_config import KEEPALIVE_PROFILE_TIMEOUT_S, KEEPALIVE_LOGIN_WAIT_S
+
+    if not alias:
+        raise LoginError("profile_restore 需要指定 alias")
+
+    profile = DATA_DIR / f"pw_profile_{alias}"
+    if not profile.exists() or not any(profile.iterdir()):
+        raise LoginError(f"profile {profile.name} 不存在，需先运行 `login --name {alias}` 建立 profile")
+
+    effective_timeout = timeout_s or KEEPALIVE_PROFILE_TIMEOUT_S
+    wait_s = KEEPALIVE_LOGIN_WAIT_S
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch_persistent_context(
+            user_data_dir=str(profile),
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        try:
+            page = browser.new_page()
+            page.goto("https://www.xiaohongshu.com/explore",
+                      wait_until="domcontentloaded", timeout=15000)
+            # 等待浏览器恢复 session
+            page.wait_for_timeout(wait_s * 1000)
+
+            # 检查 cookie 是否齐全
+            ck = {c["name"]: c["value"] for c in browser.cookies()}
+            if not REQUIRED_KEYS.issubset(ck.keys()):
+                raise LoginError("profile 中 session 已过期（cookie 不完整）")
+
+            # 在线验证：非 guest 才是真登录
+            try:
+                is_logged_in = page.evaluate(
+                    """async () => {
+                        const r = await fetch('/api/sns/web/v2/user/me', {credentials:'include'});
+                        const j = await r.json();
+                        return j && j.data && j.data.guest === false;
+                    }"""
+                )
+            except Exception:
+                is_logged_in = False
+
+            if not is_logged_in:
+                raise LoginError("profile 中 session 已过期（服务端验证为 guest）")
+
+        finally:
+            browser.close()
+
+    print(f"[LOGIN] Profile 恢复成功（{alias}），{len(ck)} 个 cookie", file=sys.stderr)
+    return ck
+
+
+# ---------------------------------------------------------------------------
 # 档位 3: 手动粘贴
 # ---------------------------------------------------------------------------
 
@@ -302,13 +378,20 @@ def acquire_via_manual() -> dict[str, str]:
 # 档位 1.5: 跨平台原生浏览器 cookie 提取（无需 rookiepy）
 # ---------------------------------------------------------------------------
 
-def acquire_via_win_native(browser: str = "edge") -> dict[str, str]:
+def acquire_via_native_browser(browser: str = "edge") -> dict[str, str]:
     """跨平台：用 Playwright 读取用户真实浏览器配置中的 cookie。
 
     支持 Windows / macOS / Linux 的 Edge 和 Chrome。
     WSL 不适用（由 wsl-* tier 处理）。
-    已合并原 xhs_login_win_native.py（已删除）。
     """
+    try:
+        import xhs_login_native  # type: ignore
+    except ImportError as e:
+        raise LoginError(f"无法加载 cookie 提取模块：{e}")
+    try:
+        return xhs_login_native.extract_cookies(browser)
+    except (FileNotFoundError, ValueError, OSError) as e:
+        raise LoginError(f"{browser} cookie 提取失败：{e}")
     try:
         import xhs_login_native  # type: ignore
     except ImportError as e:
@@ -347,7 +430,7 @@ def _current_platform() -> str:
 
 # 平台特定 tier 名称集合
 _WSL_TIERS = {"wsl-edge", "wsl-edge-cdp", "wsl-chrome", "wsl-chrome-cdp"}
-_WIN_TIERS = {"win-edge", "win-chrome"}
+_NATIVE_TIERS = {"native-edge", "native-chrome"}
 
 
 # ---------------------------------------------------------------------------
@@ -355,23 +438,30 @@ _WIN_TIERS = {"win-edge", "win-chrome"}
 # ---------------------------------------------------------------------------
 
 def acquire_cookies(prefer: str = "auto", headless_qr: bool = False, profile_hint: str = "") -> dict[str, str]:
-    """多档 fallback。prefer ∈ {auto, rookie, wsl-edge, wsl-chrome, qr, manual}。
+    """多档 fallback。prefer ∈ {auto, rookie, edge, chrome, native, wsl-edge, wsl-chrome, qr, manual}。
 
     auto：根据平台自动选择最优链（非 WSL 环境自动跳过 WSL tier）。
     profile_hint: 多账号时传入别名，QR 登录用独立 profile 避免冲突。
     """
+    # 向后兼容旧名称
+    compat = {"win-edge": "native-edge", "win-chrome": "native-chrome"}
+    prefer = compat.get(prefer, prefer)
+
     chain = {
-        "auto":          ["win-edge", "win-chrome", "rookie", "wsl-edge-cdp", "wsl-edge", "wsl-chrome-cdp", "wsl-chrome", "qr", "manual"],
-        "rookie":        ["rookie", "win-edge", "win-chrome", "wsl-edge-cdp", "wsl-edge", "wsl-chrome-cdp", "wsl-chrome", "qr", "manual"],
-        "win-edge":      ["win-edge", "win-chrome", "qr", "manual"],
-        "win-chrome":    ["win-chrome", "win-edge", "qr", "manual"],
-        "wsl-edge":      ["wsl-edge", "wsl-edge-cdp", "wsl-chrome-cdp", "wsl-chrome", "qr", "manual"],
-        "wsl-edge-cdp":  ["wsl-edge-cdp", "wsl-edge", "wsl-chrome-cdp", "wsl-chrome", "qr", "manual"],
-        "wsl-chrome":    ["wsl-chrome", "wsl-chrome-cdp", "wsl-edge-cdp", "wsl-edge", "qr", "manual"],
-        "wsl-chrome-cdp":["wsl-chrome-cdp", "wsl-chrome", "wsl-edge-cdp", "wsl-edge", "qr", "manual"],
-        "qr":            ["qr", "manual"],
-        "manual":        ["manual"],
-    }.get(prefer, ["win-edge", "win-chrome", "rookie", "wsl-edge-cdp", "wsl-edge", "wsl-chrome-cdp", "wsl-chrome", "qr", "manual"])
+        "auto":            ["rookie", "native-edge", "native-chrome", "wsl-edge-cdp", "wsl-edge", "wsl-chrome-cdp", "wsl-chrome", "qr", "manual"],
+        "rookie":          ["rookie", "native-edge", "native-chrome", "wsl-edge-cdp", "wsl-edge", "wsl-chrome-cdp", "wsl-chrome", "qr", "manual"],
+        "native":          ["native-edge", "native-chrome", "rookie", "qr", "manual"],
+        "edge":            ["native-edge", "rookie", "qr", "manual"],
+        "chrome":          ["native-chrome", "rookie", "qr", "manual"],
+        "native-edge":     ["native-edge", "native-chrome", "rookie", "qr", "manual"],
+        "native-chrome":   ["native-chrome", "native-edge", "rookie", "qr", "manual"],
+        "wsl-edge":        ["wsl-edge", "wsl-edge-cdp", "wsl-chrome-cdp", "wsl-chrome", "qr", "manual"],
+        "wsl-edge-cdp":    ["wsl-edge-cdp", "wsl-edge", "wsl-chrome-cdp", "wsl-chrome", "qr", "manual"],
+        "wsl-chrome":      ["wsl-chrome", "wsl-chrome-cdp", "wsl-edge-cdp", "wsl-edge", "qr", "manual"],
+        "wsl-chrome-cdp":  ["wsl-chrome-cdp", "wsl-chrome", "wsl-edge-cdp", "wsl-edge", "qr", "manual"],
+        "qr":              ["qr", "manual"],
+        "manual":          ["manual"],
+    }.get(prefer, ["rookie", "native-edge", "native-chrome", "wsl-edge-cdp", "wsl-edge", "wsl-chrome-cdp", "wsl-chrome", "qr", "manual"])
 
     # 非 WSL 环境自动跳过 WSL tier（避免无意义的错误输出）
     _plat = _current_platform()
@@ -379,15 +469,15 @@ def acquire_cookies(prefer: str = "auto", headless_qr: bool = False, profile_hin
         chain = [t for t in chain if t not in _WSL_TIERS]
     # WSL 环境跳过 native browser tier（WSL 无本地 Edge/Chrome）
     if _plat == "wsl":
-        chain = [t for t in chain if t not in _WIN_TIERS]
+        chain = [t for t in chain if t not in _NATIVE_TIERS]
 
     last_err: Exception | None = None
     for tier in chain:
         try:
-            if tier == "win-edge":
-                cookies = acquire_via_win_native("edge")
-            elif tier == "win-chrome":
-                cookies = acquire_via_win_native("chrome")
+            if tier in ("native-edge", "edge"):
+                cookies = acquire_via_native_browser("edge")
+            elif tier in ("native-chrome", "chrome"):
+                cookies = acquire_via_native_browser("chrome")
             elif tier == "rookie":
                 cookies = acquire_via_rookiepy()
             elif tier == "wsl-edge":

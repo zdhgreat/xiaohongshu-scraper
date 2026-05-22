@@ -336,7 +336,6 @@ class Fetcher:
             time.sleep(10)
             # 单次重试
             try:
-                proxy_url, proxy_label = self._resolve_proxy()
                 if method == "GET":
                     resp = self.session.get(url, headers=headers, timeout=20)
                 else:

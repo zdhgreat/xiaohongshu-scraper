@@ -12,9 +12,9 @@
 | 项目 | 内容 |
 |------|------|
 | 仓库路径 | `~/workspace/xiaohongshu_scraper_skill` |
-| 代码规模 | ~5,200 行 Python（18 个模块） + 4 个 JS 签名资产 |
-| 当前版本 | v1.5 |
-| 完成阶段 | P1 MVP + P1.5 反风控 + P2 强化 + P3 扩展 + P4 视频 + P5 图片（全部闭合） |
+| 代码规模 | ~5,800 行 Python（18 个模块） + 4 个 JS 签名资产 |
+| 当前版本 | v1.6.0 |
+| 完成阶段 | P1 MVP + P1.5 反风控 + P2 强化 + P3 扩展 + P4 视频 + P5 图片 + P6 稳定性（全部闭合） |
 | 未启动阶段 | 无 |
 
 ---
@@ -32,7 +32,7 @@
 ### 2.2 实际实现方向
 
 - **技术路线**：`curl_cffi` Chrome TLS 模拟为主 + Playwright 浏览器接管为 fallback，**未采用 DrissionPage**
-- **架构结果**：多文件拆分（18 个 Python 模块），主文件 `xhs.py` 940 行
+- **架构结果**：多文件拆分（18 个 Python 模块），主文件 `xhs.py` ~1000 行
 - **数据库**：5 张表（users / notes / comments / search_cache / crawl_state），**images/videos 独立表被砍**，改为从 `raw_json` 中按需提取
 - **登录方式**：新增 WSL Edge CDP 桥接（`xhs_login_wsl.py`），支持 Windows 宿主浏览器透传；保留 rookiepy/QR/manual 三档
 - **签名维护**：改为 **三档签名可降级**（PlaywrightSigner / EmbedJsSigner / PyPortSigner），EmbedJs 基于社区 `cv-cat/Spider_XHS` 的 JS 资产，月度替换文件即可，**无需维护算法本身**
@@ -74,6 +74,11 @@
 | 浏览器接管（460/461 fallback） | ✅ 规划 | ✅ 完成 | Playwright 实现 |
 | `PyPortSigner`（纯 Python 签名） | — | ⚠️ **占位未实现** | 明确 raise 提示降级 |
 | `xhs_xray.js` 完整集成 | — | ⚠️ **部分集成** | x-xray-traceid 已加，x-rap-param 未全面启用 |
+| 转录纠错（OCR+LLM） | — | ✅ 完成 | v1.6.0 新增，用 OCR 画面文字纠正 Whisper 转录错误 |
+| 心跳保活 | — | ✅ 完成 | v1.6.0 新增，防止 Kimi 2.6 等 60s 静默 kill |
+| PID 文件锁 | — | ✅ 完成 | v1.6.0 新增，四层防御解决数据库死锁 |
+| 输出按博主分目录 | — | ✅ 完成 | v1.6.0 新增，`output/<博主名>/<标题>.md` |
+| 评论精简渲染 | — | ✅ 完成 | v1.6.0 新增，Top 20 主评论 + Top 5 子回复 |
 
 **代码层面已修复项（P3 阶段闭合）：**
 - ~~`scripts/xhs.py`：`build_parser()` 中 `p_login` 未暴露 `--name` 参数~~ → 已修复
@@ -116,10 +121,18 @@ xiaohongshu_scraper_skill/
 │   └── crypto-js.min.js     # JS 引擎依赖
 ├── data/                    # 运行时数据（gitignore）
 │   ├── xhs.db               # SQLite
+│   ├── xhs.pid              # PID 文件锁（运行时）
 │   ├── cookies.json         # 持久化 cookie
 │   ├── accounts/            # 多账号 cookie 文件
-│   ├── output/              # MD + CSV 输出
+│   ├── output/              # 导出输出
+│   │   ├── <博主名>/        # MD 按博主分目录
+│   │   │   └── <标题>_<id>.md
+│   │   └── *.csv / *.json   # 批量导出
 │   ├── media/               # 下载的媒体文件
+│   │   └── <博主名>/<标题>/
+│   │       ├── img_*.jpg / video.mp4
+│   │       ├── keyframes/   # 视频关键帧（保留）
+│   │       └── _cache/      # 临时分析缓存（可清理）
 │   └── pw_profile/          # Playwright 浏览器 profile
 └── scripts/
     ├── xhs.py               # CLI 入口 + 命令调度（~940 行）
@@ -188,17 +201,76 @@ xiaohongshu_scraper_skill/
 
 ---
 
-## 七、已知问题与限制
+## 七、P6 稳定性增强（v1.6.0）
+
+### 7.1 转录纠错管线
+
+**问题**：Whisper tiny 模型对中文同音字和英文术语识别错误严重（"缺德"→"确"、"Ctrl+C"→"康车性"、"Faster"→"Festor"）。
+
+**解决方案**：在视频分析管线的 OCR 之后、摘要之前，插入 LLM 纠错步骤：
+
+```
+extract → transcribe → ocr → [correct] → summary
+```
+
+纠错函数 `_correct_transcript()` 使用 OCR 画面文字作为地面真相参照，调用已有 LLM 后端（OpenAI/Ollama）纠正转录错误。无 LLM 可用时优雅降级，保留原始转录。
+
+| 配置项 | 变更 |
+|--------|------|
+| 默认 Whisper 模型 | `tiny` → `base`（WER 从 ~30% 降至 ~15%） |
+| OCR 存储 | 纯文本 → JSON 数组（保留帧关联） |
+| 纠错缓存 | `_cache/transcript_corrected.json` |
+| 原始转录保留 | `_cache/transcript.json`（Whisper 原始输出） |
+
+### 7.2 四层防御解决数据库死锁
+
+**问题**：终端超时后 Python 进程未退出，持续占用 SQLite 写锁，导致后续命令报 `database is locked`。
+
+**解决方案**：
+
+| 层级 | 机制 | 代码位置 |
+|------|------|---------|
+| 1. PID 文件锁 | `_check_stale_lock()` 检测残留进程并自动清理 | `xhs_storage.py` |
+| 2. SIGTERM 处理 | 信号处理器调用 `_release_lock()` 释放 PID 文件 | `xhs.py` |
+| 3. busy_timeout | 10s → 30s，增加等待容忍度 | `xhs_storage.py` |
+| 4. atexit 清理 | 进程退出时自动释放 PID 文件 | `xhs_storage.py` |
+
+跨平台进程检测：Unix 用 `os.kill(pid, 0)`，Windows 用 `ctypes.windll.kernel32.OpenProcess`。
+
+### 7.3 心跳保活
+
+所有长耗时命令（11 个）启动后台守护线程，每 15s 向 stderr 输出心跳。防止 Kimi 2.6 等 AI 平台的 60s 静默 kill 机制误杀进程。
+
+### 7.4 输出结构优化
+
+| 改进 | 旧 | 新 |
+|------|-----|-----|
+| MD 目录 | `output/` 平铺 | `output/<博主名>/` 分目录 |
+| 文件名 | `{note_id}_{作者}_{标题}.md` | `{标题}_{note_id前8位}.md` |
+| 评论渲染 | 全量展开 | Top 20 主评论 + Top 5 子回复 + 省略提示 |
+| OCR 渲染 | 纯文本（含重复/噪声） | JSON 解析 + 去重 + 噪声过滤 |
+| 摘要标题 | 固定 `### 视频摘要` | 有摘要→`视频摘要`，无摘要→`内容提取结果` |
+
+### 7.5 文件管理
+
+- **关键帧保留**：视频分析完成后保留 `keyframes/` 目录，仅清理 audio.wav 和 JSON 缓存
+- **缓存清理重试**：Windows 文件锁兼容，3 次重试间隔 1s
+- **旧数据兼容**：纯文本 OCR → `_render_video_ocr()` 自动回退原样输出
+
+---
+
+## 八、已知问题与限制
 
 1. **PyPortSigner 有意不实现**：纯 Python 签名端口作为 auto 降级链的终点保留。不影响使用，因为 auto 模式会 fallback 到 embed-js/playwright。
 2. **WSL Playwright 依赖**：需要安装大量系统库（libnss3 等），否则浏览器闪退。
 3. **rookiepy Python 3.13+ 不兼容**：无预编译 wheel，需 Rust 工具链或改用 QR/manual。
 4. **签名 JS 月度轮换**：`xhs_main.js` 来自社区，约每月失效一次。可用 `update-js` 命令自动更新。
 5. **snownlp / jieba 可选依赖**：未安装时情感分析降级为简单词库，话题聚类降级为字符拆分。`pip install snownlp jieba` 即可启用完整功能。
+6. **转录纠错依赖 LLM**：无 OpenAI/Ollama 配置时纠错步骤自动跳过，保留 Whisper 原始输出。
 
 ---
 
-## 八、后续建议
+## 九、后续建议
 
 所有规划阶段（P1-P3）已完成。可选的增强方向：
 
@@ -211,7 +283,7 @@ xiaohongshu_scraper_skill/
 
 ---
 
-## 九、打包清单
+## 十、打包清单
 
 打包路径：`~/.hermes/skills/social-media/xiaohongshu_scraper_skill/`
 
@@ -235,6 +307,6 @@ xiaohongshu_scraper_skill/
 
 ---
 
-*报告更新时间：2026-05-19*
-*P5 扩展阶段已全部闭合，所有规划功能已完成*
+*报告更新时间：2026-05-20*
+*P6 稳定性阶段已闭合，v1.6.0*
 *完整技术文档请参阅 TECHNICAL_REPORT.md*

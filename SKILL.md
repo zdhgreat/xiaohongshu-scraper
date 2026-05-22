@@ -1,6 +1,6 @@
 ---
 name: xiaohongshu-scraper
-description: 抓取小红书（RedNote/Little Red Book/XHS）笔记、用户主页、关键词搜索结果，落库 SQLite 并导出 Markdown / CSV（飞书多维表格格式）。在用户提到"爬小红书"、"采集小红书笔记"、"抓 xhs"、"分析小红书数据"、"导出小红书到飞书"、"备份我喜欢的小红书博主"、"收集某关键词下的小红书内容"等场景时调用。三档签名（playwright/embed-js/py-port）+ 三档登录（rookiepy/QR/手动）+ 浏览器接管 的纵深防御架构，应对小红书强反爬。
+description: 抓取小红书（RedNote/Little Red Book/XHS）笔记、用户主页、关键词搜索结果，落库 SQLite 并导出 Markdown / CSV（飞书多维表格格式）。在用户提到"爬小红书"、"采集小红书笔记"、"抓 xhs"、"分析小红书数据"、"导出小红书到飞书"、"备份我喜欢的小红书博主"、"收集某关键词下的小红书内容"等场景时调用。三档签名（playwright/embed-js/py-port）+ 跨平台登录（rookiepy/原生浏览器提取/QR/手动）+ 浏览器接管 的纵深防御架构，应对小红书强反爬。
 version: "1.6.0"
 author: zhudonghai
 type: skill
@@ -132,13 +132,16 @@ python scripts/xhs.py sign-test
 ### Step 2：登录（cookie 不存在或失效时）
 
 ```bash
-python scripts/xhs.py login --prefer rookie    # 默认：从已登录的本地浏览器自动提取
+python scripts/xhs.py login                    # auto 模式：自动选择最优（rookiepy → 原生提取 → QR → 手动）
+python scripts/xhs.py login --prefer rookie    # 从已登录的本地浏览器自动提取（推荐，跨平台）
+python scripts/xhs.py login --prefer edge      # 从 Edge 浏览器提取 cookie（跨平台）
+python scripts/xhs.py login --prefer chrome    # 从 Chrome 浏览器提取 cookie（跨平台）
 python scripts/xhs.py login --prefer qr        # 弹 Chromium 让用户扫码（需 GUI）
 python scripts/xhs.py login --prefer manual    # 让用户从 DevTools 粘贴 cookie 字符串
 python scripts/xhs.py login --name <alias>     # 多账号：保存到 data/accounts/<alias>.json
 ```
 
-`--prefer` 完整选项：`auto`（自动选择最优）、`rookie`（从浏览器提取）、`qr`（扫码）、`manual`（手动粘贴）、`win-edge`/`win-chrome`（指定 Windows 浏览器）、`wsl-edge`/`wsl-chrome`/`wsl-edge-cdp`/`wsl-chrome-cdp`（WSL 环境）。
+`--prefer` 完整选项：`auto`（自动选择最优）、`rookie`（rookiepy 跨平台提取）、`edge`/`chrome`（原生浏览器提取，跨平台）、`native`（Edge + Chrome 依次尝试）、`qr`（扫码）、`manual`（手动粘贴）、`wsl-*`（WSL 环境专用）。
 
 `data/cookies.json` 存在且包含 `web_session` 和 `a1` 即视为登录有效。Cookie 有效期约 30 天。
 
@@ -146,7 +149,22 @@ python scripts/xhs.py login --name <alias>     # 多账号：保存到 data/acco
 
 > 多号爬取能显著提升日抓上限（每个号 500/天，3 个号 = 1500/天），且 460/461 风控时自动切换。
 
-**推荐方式一：扫码登录（最简单）**
+**推荐方式一：浏览器提取（跨平台，最稳定）**
+
+先用真实浏览器（Chrome / Edge / Firefox）登录 xiaohongshu.com，然后提取 cookie：
+
+```bash
+# 自动模式：rookiepy 直接读取浏览器 cookie（无需关闭浏览器）
+python scripts/xhs.py login --name account1
+# → 换浏览器账号或用无痕窗口登录另一个号
+python scripts/xhs.py login --name account2
+
+# 指定浏览器
+python scripts/xhs.py login --prefer edge --name edge_account     # 从 Edge 提取
+python scripts/xhs.py login --prefer chrome --name chrome_account # 从 Chrome 提取
+```
+
+**推荐方式二：扫码登录**
 
 ```bash
 # 每个号扫一次码即可，不需要切换浏览器
@@ -161,13 +179,15 @@ python scripts/xhs.py login --prefer qr --name account2
 
 每个 `--name` 会用独立的浏览器 profile（`data/pw_profile_<name>`），不会互相干扰。
 
-**推荐方式二：多浏览器提取（Windows）**
+**注意**：Playwright 内置 Chromium 的扫码登录 session 可能不稳定（小红书反爬检测），建议优先使用浏览器提取方式。
+
+**方式三：多浏览器提取（跨平台）**
 
 如果 Edge 和 Chrome 分别登录了不同的小红书账号：
 
 ```bash
-python scripts/xhs.py login --prefer win-edge --name edge_account
-python scripts/xhs.py login --prefer win-chrome --name chrome_account
+python scripts/xhs.py login --prefer edge --name edge_account
+python scripts/xhs.py login --prefer chrome --name chrome_account
 ```
 
 **方式三：手动粘贴（通用）**
@@ -255,11 +275,15 @@ python scripts/xhs.py analyze-video <note_id>
 ### Step 5：导出（按用户需要的格式）
 
 ```bash
-python scripts/xhs.py export --note <note_id> --format md    # 单篇 Markdown
-python scripts/xhs.py export --format csv                    # 全量 CSV（飞书导入格式）
+python scripts/xhs.py export --note <note_id> --format md    # 单篇 Markdown（多文件目录）
+python scripts/xhs.py export --format csv                    # 全量 CSV（按博主分文件）
+python scripts/xhs.py export --format csv --user <user_id>   # 指定博主的 CSV
+python scripts/xhs.py export --format json                   # 全量 JSON
+python scripts/xhs.py export --format json --user <user_id>  # 指定博主的 JSON
+python scripts/xhs.py export --format xlsx                   # 全量 XLSX（多 sheet，需 openpyxl）
 ```
 
-输出位置：`data/output/`
+输出位置：`data/output/`（Markdown 按博主分子目录，CSV 按博主分文件）
 
 ### Step 6：逐条报告（重要原则）
 
@@ -289,13 +313,21 @@ python scripts/xhs.py export --format csv                    # 全量 CSV（飞�
 | `analyze-images <id> [--mode <mode>] [--backend <b>] [--no-mermaid] [--step ocr vision mermaid]` | 图片内容智能分析（OCR+AI视觉+Mermaid图表）；`--step` 分段执行 | 否 |
 | `setup-image [--mode <mode>] [--backend <b>] [--no-mermaid]` | 交互式配置图片分析 | 否 |
 | `setup-wizard` | 统一引导向导：配置图片+视频分析（推荐首次运行） | 否 |
-| `export --format md --note <id>` | 单篇 MD | 否 |
-| `export --format csv` | 全量 CSV（飞书导入格式） | 否 |
+| `export --format md --note <id>` | 单篇 MD（多文件目录：index.md + video.md + images.md + comments.md） | 否 |
+| `export --format csv [--user <id>]` | CSV（按博主分文件，`--user` 过滤指定博主） | 否 |
+| `export --format json [--user <id>]` | JSON（`--user` 过滤指定博主） | 否 |
+| `export --format xlsx [--user <id>]` | XLSX（多 sheet: notes/users/comments，`--user` 过滤指定博主，需 openpyxl） | 否 |
 | `accounts` | 多账号状态查看 | 否 |
 | `stats [--hours N] [--account <alias>]` | 请求统计（`--account` 按账号过滤） | 否 |
 | `refresh-cookies [--force]` | 批量检查并刷新所有账号 cookie | 否 |
+| `keepalive [--daemon] [--force] [--account <alias>]` | Cookie 保活（单次或守护进程模式） | 否 |
+| `crawl-parallel --users uid1 uid2 ... [--max-pages N]` | 多账号并行爬取不同用户 | 是 |
+| `crawl-parallel --keywords kw1 kw2 ... [--max-pages N]` | 多账号并行搜索不同关键词 | 是 |
 | `update-js [--dry-run]` | 从 Spider_XHS 拉取最新签名 JS | 否 |
 | `analyze --type {sentiment\|topics} [--keyword <kw>] [--user <id>] [--note <id>] [--output json]` | 评论情感分析 / 话题聚类（`--output json` 输出 JSON） | 否 |
+| `health` | 系统健康检查（依赖+签名+账号+DB），返回码 0=健康 1=降级 2=严重 | 否 |
+| `refresh --max-age-hours N --limit N` | 重抓超过 N 小时的旧笔记（增量更新） | 是 |
+| `cleanup [--dry-run] [--vacuum]` | 数据清理：孤儿媒体、过期缓存、VACUUM 压缩 | 否 |
 
 ---
 
@@ -317,7 +349,7 @@ python scripts/xhs.py export --format md --note 6603abc123
 
 ```bash
 python scripts/xhs.py user 5fa8xxx --pages 50 --speed-mode slow --download --analyze
-python scripts/xhs.py export --format csv
+python scripts/xhs.py export --format csv --user 5fa8xxx
 ```
 
 > **用户**："搜'露营装备'前 3 页"
@@ -426,21 +458,21 @@ python scripts/xhs.py analyze-video <video_note_id> --mode ollama
 ### 视频分析耗时预期（重要）
 
 默认配置针对 **2-5 分钟内的稳定分析** 优化：
-- **Whisper 模型**: 默认 `tiny`（加载 ~5s，转录比 `base` 快 5 倍），需要更精准可改为 `base`
+- **Whisper 模型**: 默认 `base`（加载 ~10s，精度与速度平衡），追求速度可改为 `tiny`（快 5 倍但精度低）
 - **最长转录**: 默认只转录前 300 秒（5 分钟）音频，长视频自动截断
-- **典型耗时**: 短视频 30-60s，中等视频 60-120s
+- **典型耗时**: 短视频 60-90s，中等视频 90-180s
 
 > **执行要求**：运行 `analyze-video` 时，终端 timeout 设置 **300 秒（5分钟）** 以覆盖绝大多数视频。长视频（>10分钟）如需完整转录，用 `--max-duration 0` 并设置更长 timeout。含 `--download` 的批量命令 timeout 建议 600 秒。
 
 ```bash
-# 默认：tiny 模型 + 前 5 分钟音频（推荐，60-120s 完成）
+# 默认：base 模型 + 前 5 分钟音频（推荐，90-180s 完成）
 python scripts/xhs.py analyze-video <note_id>
 
-# 需要更高精度（耗时翻倍）
-python scripts/xhs.py analyze-video <note_id> --whisper-model base
+# 追求速度（精度略降，耗时减半）
+python scripts/xhs.py analyze-video <note_id> --whisper-model tiny
 
 # 长视频完整转录（可能需要 5-10 分钟）
-python scripts/xhs.py analyze-video <note_id> --max-duration 0 --whisper-model base
+python scripts/xhs.py analyze-video <note_id> --max-duration 0
 ```
 
 **推荐方式一：crawl 命令（不受终端 timeout 限制）**
@@ -768,7 +800,16 @@ python scripts/xhs.py sign-test
 
 ### 输出 Markdown 必须包含的结构
 
-每篇笔记的 MD 文件必须严格包含以下结构：
+每篇笔记导出为**多文件目录**：`output/<博主名>/<标题>_<note_id前8位>/`
+
+| 文件 | 内容 | 生成条件 |
+|------|------|----------|
+| `index.md` | 元数据 + 正文 + 图片 + 视频基本信息 + 子文件链接 | 必有 |
+| `video.md` | 视频摘要 + 语音转录 + 画面文字 | 有视频分析结果时 |
+| `images.md` | AI 描述 + 图片 OCR + Mermaid 图表 | 有图片分析结果时 |
+| `comments.md` | 全部主评论 + 子评论 | 有评论时 |
+
+#### index.md 结构
 
 ```markdown
 # 笔记标题
@@ -787,43 +828,34 @@ python scripts/xhs.py sign-test
 
 ## 图片
 
-![笔记标题·图1](..\media\博主名\笔记标题\img_01.jpg)
-![笔记标题·图2](..\media\博主名\笔记标题\img_02.jpg)
+![笔记标题·图1](..\..\..\media\博主名\笔记标题\img_01.jpg)
+![笔记标题·图2](..\..\..\media\博主名\笔记标题\img_02.jpg)
 ...
 
-### 图片分析
+## 视频（仅视频笔记）
 
-#### AI 描述
+![封面](cover_ref)
+- **时长**: 02:30
+[视频链接](video_url)
+- **本地文件**: `video.mp4`
 
-图1：描述内容...
-图2：描述内容...
-...
-【图片总览】整体概括...
+---
 
-#### 图片文字
-
-[img_01.jpg] OCR 提取的文字
-[img_02.jpg] OCR 提取的文字
-...
-
-## 评论 (N 主 + M 回复)
-
-- **用户A** (IP属地, 赞 N): 评论内容
-  - **用户B** (IP属地, 赞 N): 回复内容
-  - **用户C** (IP属地, 赞 N): 回复内容
-- **用户D** (IP属地, 赞 N): 评论内容
-...
+- [视频分析](video.md)
+- [图片分析](images.md)
+- [评论](comments.md) (N 条)
 ```
 
 ### 关键格式要求
 
 | 项目 | 要求 | 说明 |
 |------|------|------|
-| **图片路径** | 必须使用本地相对路径 | `![标题·图1](..\media\博主名\笔记标题\img_01.jpg)`，不使用远程 URL |
+| **目录结构** | `output/<博主名>/<标题>_<id前8位>/` | 每篇笔记一个子目录，包含 index.md + 可选子文件 |
+| **图片路径** | 必须使用本地相对路径 | `![标题·图1](..\..\..\media\博主名\笔记标题\img_01.jpg)`，不使用远程 URL |
 | **图片 alt 文本** | `![笔记标题·图N](...)` | 带「笔记标题·」前缀，便于 AI 理解图片上下文 |
-| **AI 描述** | 必须包含 | 每张图一段中文描述 + 末尾【图片总览】整体概括 |
-| **OCR 文字** | 必须包含 | 即使无 OCR 结果也保留标题 `[img_01.jpg]` |
-| **评论** | 必须包含 | 主评论 + 子评论，子评论用 2 空格缩进（`  - `） |
+| **AI 描述** | images.md 中必须包含 | 每张图一段中文描述 + 末尾【图片总览】整体概括 |
+| **OCR 文字** | images.md / video.md 中包含 | OCR 结果按图片/帧去重整理 |
+| **评论** | comments.md 全量输出 | 主评论 + 子评论，子评论用 2 空格缩进（`  - `），无数量上限 |
 | **评论格式** | `- **昵称** (IP属地, 赞 N): 内容` | 统一格式，IP 属地未知时显示 `?` |
 | **正文** | 保留原始格式 | 包括 emoji、换行、话题标签等 |
 | **媒体目录** | `data/media/<博主名>/<笔记标题>/` | 按博主名 + 笔记标题双层目录组织 |
@@ -852,15 +884,34 @@ AI 描述格式规范：
 
 | 文件类型 | 命名规则 | 示例 |
 |---|---|---|
-| Markdown | `{note_id}_{作者}_{标题前50字}.md` | `6603abc123_小红_露营装备推荐.md` |
-| CSV | `xhs_{N}图文+{M}视频_{YYYYMMDD_HHMMSS}.csv` | `xhs_15图文+3视频_20260518_143022.csv` |
+| Markdown 目录 | `output/<博主名>/<标题>_<note_id前8位>/` | `output/小红/露营装备推荐_6603abc1/` |
+| index.md | `index.md`（目录内） | 上述目录下的主文件 |
+| video.md | `video.md`（目录内，有视频分析时） | 视频摘要 + 转录 + OCR |
+| images.md | `images.md`（目录内，有图片分析时） | AI 描述 + OCR + Mermaid |
+| comments.md | `comments.md`（目录内，有评论时） | 全部主评论 + 子评论 |
+| CSV | `output/<博主名>/<博主名>_笔记列表.csv` | `output/小红/小红_笔记列表.csv` |
+| JSON | `output/xhs_export_{YYYYMMDD_HHMMSS}.json` 或 `output/<博主名>/<博主名>_笔记.json` | 全量或按博主 |
 | 媒体 | `data/media/<博主名>/<笔记标题>/img_01.jpg` | `data/media/小红/露营装备推荐/img_01.jpg` |
 
-无博主名时 MD 退化为 `{note_id}_{标题}.md`；无标题时退化为 `{note_id}.md`。
+无博主名时 MD 目录退化到 `output/` 下；无标题时退化为 `{note_id}/`。
 
-### Markdown（单篇笔记）
+### Markdown（单篇笔记，多文件目录）
 
 > **注意**：完整格式规范见上方「单篇笔记完整处理流程（强制标准）」节。以下为标准模板。
+
+导出后生成目录结构：
+
+```
+output/
+└── 小红/
+    └── 露营装备推荐_6603abc1/
+        ├── index.md        # 必有
+        ├── video.md         # 有视频分析时
+        ├── images.md        # 有图片分析时
+        └── comments.md      # 有评论时
+```
+
+#### index.md
 
 ```markdown
 # 笔记标题
@@ -879,68 +930,96 @@ AI 描述格式规范：
 
 ## 图片
 
-![笔记标题·图1](..\media\博主名\笔记标题\img_01.jpg)
-![笔记标题·图2](..\media\博主名\笔记标题\img_02.jpg)
+![笔记标题·图1](..\..\..\media\博主名\笔记标题\img_01.jpg)
+![笔记标题·图2](..\..\..\media\博主名\笔记标题\img_02.jpg)
 ...
 
-### 图片分析
+## 视频（仅视频笔记）
 
-#### AI 描述
+![封面](cover_ref)
+- **时长**: 02:30
+[视频链接](video_url)
+- **本地文件**: `video.mp4`
+
+---
+
+- [视频分析](video.md)
+- [图片分析](images.md)
+- [评论](comments.md) (89 条)
+```
+
+#### video.md（有视频分析时生成）
+
+```markdown
+# 笔记标题 — 视频分析
+
+## 摘要
+
+AI 生成的视频内容摘要...
+
+## 语音转录
+
+语音转文字的完整内容...
+
+## 画面文字
+
+- 第1帧 OCR 文字
+- 第2帧 OCR 文字
+...
+```
+
+#### images.md（有图片分析时生成）
+
+```markdown
+# 笔记标题 — 图片分析
+
+## AI 描述
 
 图1：场景描述内容...
 图2：场景描述内容...
 ...
 【图片总览】整体概括本组图片...
 
-#### 图片文字
+## 图片文字
 
-[img_01.jpg] OCR 提取的文字
-[img_02.jpg] OCR 提取的文字
+[img_01] OCR 提取的文字
+[img_02] OCR 提取的文字
 ...
 
-#### 路线图 / 流程图（可选，仅旅游攻略类笔记）
+## 路线图 / 流程图（可选，仅旅游攻略类笔记）
 
 ```mermaid
 graph LR
     A[起点] -->|交通方式| B[终点]
 ```
+```
 
+#### comments.md（有评论时生成）
 
-## 视频（仅视频笔记）
+```markdown
+# 笔记标题 — 评论
 
-![封面](cover_url)
-
-- **时长**: 02:30
-[视频链接](video_url)
-- **本地文件**: `video.mp4`
-
-### 视频摘要
-
-...
-
-### 语音转录
-
-...
-
-### 画面文字
-
-...
-
-## 评论 (3 主 + 5 回复)
+共 89 条主评论 + 45 条回复
 
 - **用户A** (上海, 赞 12): 评论内容
   - **用户B** (?, 赞 3): 回复内容
+- **用户C** (北京, 赞 8): 评论内容
+...
 ```
 
 **图片 alt 文本**：`![标题·图N](...)` 带「标题·」前缀，方便 AI Agent 理解图片上下文。
-**图片路径**：必须使用本地相对路径（`..\media\博主名\笔记标题\img_01.jpg`），已下载时不用远程 URL。
+**图片路径**：必须使用本地相对路径（`..\..\..\media\博主名\笔记标题\img_01.jpg`），已下载时不用远程 URL。
 **子评论缩进**：2 空格标准嵌套列表（`  - `），兼容所有 Markdown 渲染器。
+**评论无上限**：comments.md 输出全量评论，不截断。
 
-### CSV（飞书多维表格导入格式）
+### CSV（按博主分文件，飞书多维表格导入格式）
 
-26 列：序号、笔记ID、标题、正文摘要、正文全文、作者、作者ID、发布时间、话题标签、点赞、收藏、评论、分享、IP属地、图片链接、视频链接、封面链接、视频时长(秒)、视频摘要、图片OCR文字、图片分析摘要、图片Mermaid图、笔记链接、内容类型、状态、备注。UTF-8 BOM + QUOTE_ALL，飞书可直接导入。
+按博主分文件到 `output/<博主名>/<博主名>_笔记列表.csv`。可用 `--user <user_id>` 过滤指定博主。
 
-**图片列**：当本地图片已下载时，优先使用本地路径（如 `data/media/博主/标题/img_01.jpg`）；无本地图片时 fallback 到远程 URL。
+14 列：序号、标题、作者、发布时间、类型、点赞、收藏、评论、分享、IP属地、话题、笔记链接、媒体、正文摘要。UTF-8 BOM + QUOTE_ALL，飞书可直接导入。
+
+**媒体列**：显示已下载的媒体状态（如 "视频+3张图"），无下载时显示 "—"。
+**正文摘要**：截取正文前 200 字。
 
 ### 状态通知格式
 
@@ -1033,8 +1112,8 @@ xiaohongshu_scraper_skill/
 │   ├── xhs_api.py           # API 调用层 + 数据标准化
 │   ├── xhs_media.py         # 媒体下载 + 后处理编排
 │   ├── xhs_sign.py          # 三档签名引擎 + auto 路由
-│   ├── xhs_login.py         # 五档登录 fallback
-│   ├── xhs_login_native.py  # Windows/macOS 原生浏览器 Cookie 提取
+│   ├── xhs_login.py         # 跨平台多档登录 fallback（rookiepy/原生提取/QR/手动）
+│   ├── xhs_login_native.py  # 跨平台浏览器 Cookie 提取（Windows/macOS/Linux）
 │   ├── xhs_login_wsl.py     # WSL 环境 CDP 桥接登录
 │   ├── xhs_storage.py       # SQLite 存储 + Markdown/CSV 渲染
 │   ├── xhs_accounts.py      # 多账号池（LRU 轮换 + 冷却 + 指纹绑定）
@@ -1064,7 +1143,7 @@ xiaohongshu_scraper_skill/
     ├── xhs.db                # SQLite 数据库
     ├── runs.jsonl             # 请求日志
     ├── media/                # 媒体文件：<博主名>/<笔记标题>/
-    └── output/               # MD + CSV
+    └── output/               # MD（按博主/笔记子目录）+ CSV（按博主分文件）
 ```
 
 ---

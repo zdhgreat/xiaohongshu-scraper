@@ -49,6 +49,7 @@ class Account:
     total_calls: int = 0
     fingerprint: Any = None  # FingerprintProfile，由 _load_accounts 分配
     proxy_url: str | None = None  # 绑定的专属代理 URL
+    speed_mode: str | None = None  # 账号专属速率：None=跟随全局 CLI 参数
 
     def load(self) -> None:
         if not self.cookies_path.exists():
@@ -147,6 +148,7 @@ class AccountManager:
                 a.last_461_count = s.get("last_461_count", 0)
                 a.total_calls = s.get("total_calls", 0)
                 a.proxy_url = s.get("proxy_url")
+                a.speed_mode = s.get("speed_mode")
 
     def save_state(self) -> None:
         state = {a.alias: {
@@ -158,10 +160,14 @@ class AccountManager:
             "last_461_count": a.last_461_count,
             "total_calls": a.total_calls,
             "proxy_url": a.proxy_url,
+            "speed_mode": a.speed_mode,
         } for a in self.accounts.values()}
         try:
             ACCOUNTS_STATE.parent.mkdir(parents=True, exist_ok=True)
-            ACCOUNTS_STATE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+            # 原子写入：先写临时文件再 rename，防止多进程并发写时读到半写状态
+            tmp = ACCOUNTS_STATE.with_suffix('.tmp')
+            tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(ACCOUNTS_STATE)
         except OSError:
             pass
 

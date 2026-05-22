@@ -13,6 +13,7 @@ import os
 import stat
 import subprocess
 import sys
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -36,6 +37,14 @@ COOKIE_REFRESH_EVERY: int = 20
 IMPERSONATE_PROFILE: str = "chrome131"
 IP_RATE_LIMIT: int = 10
 IP_RATE_WINDOW: int = 60
+
+# ---------------------------------------------------------------------------
+# Keepalive：Cookie 自动保活
+# ---------------------------------------------------------------------------
+KEEPALIVE_PROFILE_TIMEOUT_S: int = 30    # Profile 恢复超时（秒）
+KEEPALIVE_DAEMON_INTERVAL_S: int = 3600  # 守护进程默认间隔（秒）
+KEEPALIVE_LOGIN_WAIT_S: int = 8          # 等待 session 恢复（秒）
+KEEPALIVE_FAIL_COOLDOWN_S: int = 7200    # 保活失败的短冷却（秒）
 
 # ---------------------------------------------------------------------------
 # Feed 分类
@@ -76,6 +85,29 @@ SPEED_DOWNSHIFT: dict[str, str] = {
     "slow": "paranoid",
     "paranoid": "paranoid",
 }
+
+
+# ---------------------------------------------------------------------------
+# Heartbeat：防止 HTTP 连接静默超时
+# ---------------------------------------------------------------------------
+
+class Heartbeat:
+    """后台守护线程，定期输出到 stderr 防止 HTTP 连接被服务端判定为静默。
+    适用于 Kimi/国产 API 等 60s 静默超时的场景。"""
+    def __init__(self, interval: float = 15.0):
+        self.interval = interval
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        while not self._stop.wait(self.interval):
+            print("[heartbeat] 任务仍在运行...", file=sys.stderr, flush=True)
+
+    def stop(self):
+        self._stop.set()
+        self._thread.join(timeout=1.0)
+
 
 # ---------------------------------------------------------------------------
 # User-Agent / 请求头
@@ -315,3 +347,26 @@ def apply_config() -> None:
                     sp.long_rest_every = int(vals["long_rest_every"])
                 if "long_rest" in vals:
                     sp.long_rest = tuple(vals["long_rest"])
+
+    # Keepalive 配置
+    _ka = cfg.get("keepalive", {})
+    if _ka:
+        global KEEPALIVE_PROFILE_TIMEOUT_S, KEEPALIVE_DAEMON_INTERVAL_S
+        global KEEPALIVE_LOGIN_WAIT_S, KEEPALIVE_FAIL_COOLDOWN_S
+        if "profile_timeout_s" in _ka:
+            KEEPALIVE_PROFILE_TIMEOUT_S = int(_ka["profile_timeout_s"])
+        if "daemon_interval_s" in _ka:
+            KEEPALIVE_DAEMON_INTERVAL_S = int(_ka["daemon_interval_s"])
+        if "login_wait_s" in _ka:
+            KEEPALIVE_LOGIN_WAIT_S = int(_ka["login_wait_s"])
+        if "fail_cooldown_s" in _ka:
+            KEEPALIVE_FAIL_COOLDOWN_S = int(_ka["fail_cooldown_s"])
+
+
+# ---------------------------------------------------------------------------
+# 启动时自动加载外部配置（data/config.json）
+# ---------------------------------------------------------------------------
+try:
+    apply_config()
+except Exception as _e:
+    print(f"[CONFIG] 外部配置加载失败（使用默认值）: {_e}", file=sys.stderr)

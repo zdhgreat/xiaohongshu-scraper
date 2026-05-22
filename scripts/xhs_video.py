@@ -24,7 +24,6 @@ import re
 import shutil
 import subprocess
 import sys
-import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -34,10 +33,12 @@ DATA = ROOT / "data"
 CONFIG_PATH = DATA / "video_config.json"
 MEDIA_DIR = DATA / "media"
 
+from xhs_config import Heartbeat
+
 DEFAULT_CONFIG: dict[str, Any] = {
     "enabled": False,
     "summary_mode": "none",       # none / ollama / openai / local / mcp
-    "whisper_model": "tiny",      # tiny(base快5倍) / base / small / medium / large-v3
+    "whisper_model": "base",      # tiny(base快5倍) / base / small / medium / large-v3
     "whisper_beam_size": 3,       # 降低 beam_size 加速（默认5→3，精度略降）
     "max_transcribe_seconds": 300, # 最多转录前 N 秒音频（0=不限制）
     "frame_interval": 5,          # 关键帧间隔（秒）
@@ -161,6 +162,20 @@ def extract_audio(
 
 # 模型缓存：避免每次调用都重新加载（140MB-3GB）
 _whisper_cache: tuple[str, Any] | None = None
+_ocr_engine: Any = None
+
+
+def _get_ocr():
+    """获取或创建 RapidOCR 实例（带缓存）。"""
+    global _ocr_engine
+    if _ocr_engine is not None:
+        return _ocr_engine
+    try:
+        from rapidocr_onnxruntime import RapidOCR  # type: ignore
+        _ocr_engine = RapidOCR()
+        return _ocr_engine
+    except ImportError:
+        return None
 
 
 def _get_whisper_model(model_size: str = "base"):
@@ -236,28 +251,38 @@ def extract_keyframes(video_path: Path, output_dir: Path, interval: int = 5) -> 
 # OCR
 # ----------------------------------------------------------------
 
-def ocr_frames(frame_paths: list[Path]) -> list[dict[str, str]]:
-    """对帧图片做 OCR，返回 [{"frame": "frame_0001.jpg", "text": "..."}]。"""
+def _ocr_single(fp: Path) -> dict[str, str] | None:
+    """对单张图片做 OCR。"""
+    ocr = _get_ocr()
+    if ocr is None:
+        return None
     try:
-        from rapidocr_onnxruntime import RapidOCR  # type: ignore
-    except ImportError:
+        img_result, _ = ocr(str(fp))
+        texts = []
+        if img_result:
+            for item in img_result:
+                if len(item) >= 2 and item[1].strip():
+                    texts.append(item[1].strip())
+        if texts:
+            return {"frame": fp.name, "text": " ".join(texts)}
+    except Exception:
+        pass
+    return None
+
+
+def ocr_frames(frame_paths: list[Path]) -> list[dict[str, str]]:
+    """对帧图片做 OCR，返回 [{"frame": "frame_0001.jpg", "text": "..."}]。复用 OCR 实例。"""
+    ocr = _get_ocr()
+    if ocr is None:
         _msg("rapidocr 未安装，跳过 OCR")
         return []
-    ocr = RapidOCR()
+
     results: list[dict[str, str]] = []
     for fp in frame_paths:
-        try:
-            img_result, _ = ocr(str(fp))
-            texts = []
-            if img_result:
-                for item in img_result:
-                    # item: [bbox, text, confidence]
-                    if len(item) >= 2 and item[1].strip():
-                        texts.append(item[1].strip())
-            if texts:
-                results.append({"frame": fp.name, "text": " ".join(texts)})
-        except Exception:
-            continue
+        r = _ocr_single(fp)
+        if r:
+            results.append(r)
+
     _msg(f"OCR 完成: {len(results)}/{len(frame_paths)} 帧有文字")
     return results
 
@@ -515,6 +540,77 @@ _SUMMARY_BACKENDS = {
 }
 
 
+def _correct_via_openai(prompt: str, cfg: dict, fallback: str) -> str:
+    """通过 OpenAI API 纠正转录错误。"""
+    api_key = cfg.get("openai_api_key", "")
+    if not api_key:
+        return fallback
+    model = cfg.get("openai_model", "gpt-4o-mini")
+    base_url = cfg.get("openai_base_url", "") or "https://api.openai.com/v1"
+    try:
+        import requests as _req  # type: ignore
+        resp = _req.post(
+            f"{base_url.rstrip('/')}/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={"model": model, "messages": [{"role": "user", "content": prompt}], "max_tokens": 2000},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"].strip() or fallback
+    except Exception as e:
+        _msg(f"纠错 OpenAI 调用失败: {e}")
+        return fallback
+
+
+def _correct_via_ollama(prompt: str, cfg: dict, fallback: str) -> str:
+    """通过 Ollama 纠正转录错误。"""
+    url = cfg.get("ollama_url", "http://localhost:11434")
+    model = cfg.get("ollama_model", "qwen2.5:7b")
+    try:
+        import requests as _req  # type: ignore
+        resp = _req.post(
+            f"{url}/api/generate",
+            json={"model": model, "prompt": prompt, "stream": False},
+            timeout=120,
+        )
+        resp.raise_for_status()
+        return resp.json().get("response", "").strip() or fallback
+    except Exception as e:
+        _msg(f"纠错 Ollama 调用失败: {e}")
+        return fallback
+
+
+def _correct_transcript(transcript: str, ocr_results: list[dict], cfg: dict) -> str:
+    """用 OCR 画面文字做参照，调用 LLM 纠正 Whisper 转录中的同音字和英文错误。"""
+    ocr_text = " ".join(r["text"] for r in ocr_results)
+    if not transcript or not ocr_text:
+        return transcript
+
+    # 从 OCR 提取关键术语（英文单词、技术名词）
+    ocr_terms = set(re.findall(r'[A-Za-z][A-Za-z0-9+._#/-]{2,}', ocr_text))
+
+    prompt = (
+        "你是中文语音转录纠错助手。Whisper 语音识别的原始转录存在同音字和英文识别错误。\n"
+        "以下是从视频画面 OCR 识别出的文字，这些是准确的参照。\n\n"
+        "请修正转录中的错误：\n"
+        "1. 英文单词识别错误（如 Cloud→Claude, Festor→Faster）\n"
+        "2. 中文同音字错误（如 确→缺德, 康车性→Ctrl+C）\n"
+        "3. 用 OCR 中的准确术语替换转录中的错误版本\n\n"
+        f"【OCR 画面文字（参照）】\n{ocr_text[:2000]}\n\n"
+        f"【OCR 中的关键术语】\n{', '.join(sorted(ocr_terms))}\n\n"
+        f"【原始转录】\n{transcript}\n\n"
+        "请输出修正后的完整转录（仅输出文本，不要解释）："
+    )
+
+    mode = cfg.get("summary_mode", "none")
+    if mode == "openai":
+        return _correct_via_openai(prompt, cfg, transcript)
+    elif mode == "ollama":
+        return _correct_via_ollama(prompt, cfg, transcript)
+    else:
+        return transcript  # 无 LLM 可用则跳过
+
+
 def generate_summary(
     transcript: str,
     ocr_results: list[dict],
@@ -610,7 +706,7 @@ def analyze_video(
             try:
                 whisper_result = transcribe(
                     audio_cache,
-                    model_size=cfg.get("whisper_model", "tiny"),
+                    model_size=cfg.get("whisper_model", "base"),
                     beam_size=cfg.get("whisper_beam_size", 3),
                 )
                 result["transcript"] = whisper_result["text"]
@@ -647,6 +743,31 @@ def analyze_video(
             except Exception as e:
                 _msg(f"OCR 失败: {e}")
 
+    # 3.5 转录纠错（需要 transcript + ocr + LLM 后端）
+    if result["transcript"] and result["ocr_results"]:
+        corrected_cache = cache_dir / "transcript_corrected.json"
+        if corrected_cache.exists():
+            try:
+                result["transcript"] = json.loads(
+                    corrected_cache.read_text(encoding="utf-8")
+                ).get("text", result["transcript"])
+                _msg("已加载纠错缓存")
+            except Exception:
+                pass
+        else:
+            original = result["transcript"]
+            corrected = _correct_transcript(original, result["ocr_results"], cfg)
+            if corrected != original:
+                corrected_cache.write_text(
+                    json.dumps(
+                        {"text": corrected, "original": original},
+                        ensure_ascii=False, indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+                _msg(f"转录纠错完成: {len(original)} → {len(corrected)} 字")
+                result["transcript"] = corrected
+
     # 4. AI 摘要（summary 步骤）
     if all_steps or "summary" in steps:
         frame_dir = cache_dir / "frames"
@@ -661,12 +782,14 @@ def analyze_video(
         except Exception as e:
             _msg(f"摘要生成失败: {e}")
 
-    # 清理缓存目录（仅在完整执行时）
+    # 清理缓存目录（保留关键帧图片）
     if all_steps and cache_dir.exists():
-        try:
-            shutil.rmtree(cache_dir, ignore_errors=True)
-        except Exception:
-            pass
+        for f in [audio_cache, transcript_cache, ocr_cache, cache_dir / "transcript_corrected.json"]:
+            if f and f.exists():
+                try:
+                    f.unlink()
+                except Exception:
+                    pass
 
     return result
 
@@ -677,23 +800,6 @@ def analyze_video(
 
 def _msg(text: str) -> None:
     print(f"[VIDEO] {text}", file=sys.stderr, flush=True)
-
-
-class _Heartbeat:
-    """后台守护线程，定期输出到 stderr 防止连接被静默 kill。"""
-    def __init__(self, interval: float = 15.0):
-        self.interval = interval
-        self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-
-    def _run(self):
-        while not self._stop.wait(self.interval):
-            print("[heartbeat] 任务仍在运行...", file=sys.stderr, flush=True)
-
-    def stop(self):
-        self._stop.set()
-        self._thread.join(timeout=1.0)
 
 
 def extract_video_cover(raw: dict) -> str:
@@ -734,7 +840,7 @@ def cmd_analyze_video(args) -> int:
     import xhs_media
 
     # 心跳：防止长耗时任务被 Kimi 2.6 等平台静默 kill
-    hb = _Heartbeat()
+    hb = Heartbeat()
     conn = xhs_storage.connect()
     try:
         row = xhs_storage.get_note(conn, args.note_id)
@@ -795,7 +901,7 @@ def cmd_analyze_video(args) -> int:
         result = analyze_video(video_local, cfg, steps=steps)
 
         # 将结果存入 DB
-        ocr_text = " ".join(r["text"] for r in result.get("ocr_results", []))
+        ocr_text = json.dumps(result.get("ocr_results", []), ensure_ascii=False)
         xhs_storage.update_video_analysis(
             conn,
             args.note_id,
@@ -841,7 +947,7 @@ def cmd_analyze_video(args) -> int:
         # 重新渲染 MD
         try:
             md = xhs_storage.write_markdown(conn, args.note_id)
-            print(f"     MD 已更新: {md.name}")
+            print(f"     MD 已更新: {md.parent.name}/{md.name}")
         except Exception:
             pass
 

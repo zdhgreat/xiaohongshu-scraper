@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import xhs_accounts
 import xhs_bootstrap
 import xhs_config
+from xhs_config import Heartbeat
 import xhs_log
 import xhs_login
 import xhs_media
@@ -47,27 +48,6 @@ from xhs_bootstrap import cmd_setup, cmd_setup_wizard
 from xhs_image import cmd_analyze_images, cmd_setup_image
 from xhs_video import cmd_analyze_video, cmd_setup_video
 
-
-# ---------------------------------------------------------------------------
-# 心跳线程：防止HTTP连接静默超时
-# ---------------------------------------------------------------------------
-
-class _Heartbeat:
-    """后台守护线程，定期输出到stderr防止HTTP连接被服务端判定为静默。
-    适用于 Kimi/国产API 等 60s 静默超时的场景。"""
-    def __init__(self, interval: float = 15.0):
-        self.interval = interval
-        self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-
-    def _run(self):
-        while not self._stop.wait(self.interval):
-            print("[heartbeat] 任务仍在运行...", file=sys.stderr, flush=True)
-
-    def stop(self):
-        self._stop.set()
-        self._thread.join(timeout=1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -130,7 +110,7 @@ def _desc_preview(note: dict, max_len: int = 50) -> str:
 # ---------------------------------------------------------------------------
 
 def _validate_accounts(mgr: xhs_accounts.AccountManager) -> None:
-    """启动预检：在线验证所有账号 cookie，无效的标记 24h 冷却。"""
+    """启动预检：在线验证所有账号 cookie，无效的尝试自动恢复。"""
     if not mgr.has_accounts():
         return
     print(f"[CLI] 启动预检：验证 {len(mgr.accounts)} 个账号的 cookie ...", file=sys.stderr)
@@ -147,8 +127,14 @@ def _validate_accounts(mgr: xhs_accounts.AccountManager) -> None:
             nickname = (user_info or {}).get("nickname", "")
             print(f"  [{alias:15s}] 有效{f' ({nickname})' if nickname else ''}", file=sys.stderr)
         else:
-            acc.mark_invalid()
-            print(f"  [{alias:15s}] 已过期（已跳过）", file=sys.stderr)
+            # 尝试自动恢复（Profile Session 恢复 → win-native）
+            import xhs_keepalive
+            status = xhs_keepalive.keepalive_single_account(alias, acc)
+            if "失败" in status:
+                acc.mark_invalid()
+                print(f"  [{alias:15s}] 自动恢复失败（已标记冷却）", file=sys.stderr)
+            else:
+                print(f"  [{alias:15s}] 自动恢复成功: {status}", file=sys.stderr)
     mgr.save_state()
 
 
@@ -169,13 +155,17 @@ def _make_fetcher(args: argparse.Namespace) -> Fetcher:
     proxy_pool = xhs_proxy.ProxyPool([proxies_arg] if proxies_arg else None)
     if proxy_pool.is_active():
         print(f"[CLI] 代理池启用：{len(proxy_pool)} 个", file=sys.stderr)
-    # 3. signer / speed
+    # 3. signer / speed（账号专属速率优先于 CLI 参数）
+    acc = mgr.get(force)
+    effective_speed = acc.speed_mode or args.speed_mode
+    if effective_speed != args.speed_mode:
+        print(f"[CLI] 账号 {acc.alias} 使用专属速率: {effective_speed}", file=sys.stderr)
     signer = xhs_sign.make_signer(args.sign_mode)
-    speed = xhs_config.SPEED_PROFILES[args.speed_mode]
+    speed = xhs_config.SPEED_PROFILES[effective_speed]
     return Fetcher(signer, speed, mgr, proxy_pool,
                     force_account=force,
                     sign_mode_label=args.sign_mode,
-                    speed_mode_label=args.speed_mode)
+                    speed_mode_label=effective_speed)
 
 
 # ---------------------------------------------------------------------------
@@ -224,11 +214,26 @@ def cmd_accounts(args: argparse.Namespace) -> int:
     if not mgr.has_accounts():
         print("无账号。先跑 `login` 或 `login --name <alias>`。")
         return 0
+    # --set-speed: 设置账号专属速率
+    set_speed = getattr(args, 'set_speed', None)
+    if set_speed:
+        alias, _, mode = set_speed.partition("=")
+        if not mode or mode not in xhs_config.SPEED_PROFILES:
+            print(f"[ERR] 用法: --set-speed alias=mode（mode: {', '.join(xhs_config.SPEED_PROFILES.keys())}）")
+            return 1
+        if alias not in mgr.accounts:
+            print(f"[ERR] 未知账号: {alias}（可用: {', '.join(mgr.accounts.keys())}）")
+            return 1
+        mgr.accounts[alias].speed_mode = mode
+        mgr.save_state()
+        print(f"[OK] {alias} 专属速率已设为 {mode}")
     print(f"=== 共 {len(mgr.accounts)} 个账号 ===")
     for s in mgr.stats():
         cd = f"cooldown→{s['cooldown_until']}" if s['cooldown_until'] else ""
+        acc = mgr.accounts[s['alias']]
+        spd = f"速率:{acc.speed_mode}" if acc.speed_mode else ""
         print(f"  [{s['alias']:15s}] 日抓 {s['daily_count']:3d}/{xhs_config.DAILY_HARD_CAP}  累计 {s['total_calls']:5d}"
-              f"  460×{s['last_460']}  461×{s['last_461']}  最近用 {s['last_used'] or '从未'}  {cd}")
+              f"  460×{s['last_460']}  461×{s['last_461']}  {spd}  最近用 {s['last_used'] or '从未'}  {cd}")
     return 0
 
 
@@ -291,6 +296,50 @@ def cmd_refresh_cookies(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_keepalive(args: argparse.Namespace) -> int:
+    """多账号 Cookie 自动保活。"""
+    import xhs_keepalive
+    mgr = xhs_accounts.AccountManager()
+    if not mgr.has_accounts():
+        print("无账号。先跑 `login` 或 `login --name <alias>`。")
+        return 0
+    return xhs_keepalive.run_daemon(
+        mgr,
+        interval_s=getattr(args, 'interval', 0),
+        single_run=not getattr(args, 'daemon', False),
+        force=getattr(args, 'force', False),
+        account=getattr(args, 'account', None),
+    )
+
+
+def cmd_crawl_parallel(args: argparse.Namespace) -> int:
+    """多账号并行爬取。"""
+    import xhs_parallel
+    users = getattr(args, 'users', None) or []
+    keywords = getattr(args, 'keywords', None) or []
+    if users:
+        return xhs_parallel.run_parallel(
+            "user", users,
+            max_pages=args.max_pages,
+            speed_mode=args.speed_mode,
+            sign_mode=args.sign_mode,
+            download=getattr(args, 'download', False),
+            analyze=getattr(args, 'analyze', False),
+        )
+    elif keywords:
+        return xhs_parallel.run_parallel(
+            "search", keywords,
+            max_pages=args.max_pages,
+            speed_mode=args.speed_mode,
+            sign_mode=args.sign_mode,
+            download=getattr(args, 'download', False),
+            analyze=getattr(args, 'analyze', False),
+        )
+    else:
+        print("[ERR] 请指定 --users 或 --keywords", file=sys.stderr)
+        return 1
+
+
 def cmd_note(args: argparse.Namespace) -> int:
     with fetch_session(args) as (fetcher, conn):
         # 优先用 CLI 显式提供的 token；否则查 DB（之前 search/user 入库时存的）
@@ -323,7 +372,7 @@ def cmd_note(args: argparse.Namespace) -> int:
         path = xhs_storage.write_markdown(conn, note["note_id"])
         title = note.get("title") or note.get("description", "")[:30] or "(无标题)"
         print(f"[OK] 笔记入库并渲染: 《{title}》")
-        print(f"     文件: {path}")
+        print(f"     文件: {path.parent.name}/{path.name}")
         # 自动下载图片
         xhs_media.auto_download_note(note, conn)
         summary = xhs_storage.render_update_summary(conn, note["note_id"])
@@ -333,7 +382,7 @@ def cmd_note(args: argparse.Namespace) -> int:
 
 
 def cmd_user(args: argparse.Namespace) -> int:
-    hb = _Heartbeat()
+    hb = Heartbeat()
     try:
         with fetch_session(args) as (fetcher, conn):
             info = fetch_user_info(fetcher, args.user_id)
@@ -384,7 +433,7 @@ def cmd_user(args: argparse.Namespace) -> int:
 
 
 def cmd_search(args: argparse.Namespace) -> int:
-    hb = _Heartbeat()
+    hb = Heartbeat()
     try:
         with fetch_session(args) as (fetcher, conn):
             total = 0
@@ -424,7 +473,7 @@ def cmd_search(args: argparse.Namespace) -> int:
 
 def cmd_comments(args: argparse.Namespace) -> int:
     """抓某笔记的评论树。会复用 DB 里存的 xsec_token。"""
-    hb = _Heartbeat()
+    hb = Heartbeat()
     try:
         with fetch_session(args) as (fetcher, conn):
             row = xhs_storage.get_note(conn, args.note_id)
@@ -492,7 +541,7 @@ def cmd_comments(args: argparse.Namespace) -> int:
             title = row["title"] or "(无标题)"
             path = xhs_storage.write_markdown(conn, args.note_id)
             print(f"     《{title}》MD 已更新: 新增 {main_count} 主评论 + {sub_count} 子评论")
-            print(f"     文件: {path}")
+            print(f"     文件: {path.parent.name}/{path.name}")
             return 0
     finally:
         hb.stop()
@@ -712,7 +761,7 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
 
 def cmd_refresh(args: argparse.Namespace) -> int:
     """重抓超过 N 小时的笔记（增量更新）。"""
-    hb = _Heartbeat()
+    hb = Heartbeat()
     try:
         with fetch_session(args) as (fetcher, conn):
             cutoff = (datetime.now(timezone.utc) - timedelta(hours=args.max_age_hours)).strftime("%Y-%m-%d %H:%M:%S")
@@ -766,40 +815,65 @@ def cmd_refresh(args: argparse.Namespace) -> int:
 
 def cmd_export(args: argparse.Namespace) -> int:
     conn = xhs_storage.connect()
+    user_id = getattr(args, "user", None)
     try:
         if args.format == "md":
-            if not args.note:
-                print("[ERR] --format md 需配合 --note <id>", file=sys.stderr)
+            if args.note:
+                # 单篇导出
+                row = xhs_storage.get_note(conn, args.note)
+                if not row:
+                    print(f"[ERR] 笔记 {args.note} 不在 DB", file=sys.stderr)
+                    return 1
+                files = xhs_storage.write_markdown_files(conn, args.note)
+                title = row["title"] or "(无标题)"
+                print(f"[OK] 《{title}》已导出 Markdown")
+                for f in files:
+                    print(f"     {f.parent.name}/{f.name}")
+                summary = xhs_storage.render_update_summary(conn, args.note)
+                if summary:
+                    print(f"     内容: {summary}")
+            elif user_id:
+                # 按博主批量导出
+                rows = conn.execute(
+                    "SELECT note_id FROM notes WHERE user_id = ? ORDER BY rowid",
+                    (user_id,)
+                ).fetchall()
+                if not rows:
+                    print(f"[ERR] 用户 {user_id} 没有笔记", file=sys.stderr)
+                    return 1
+                count = 0
+                for (nid,) in rows:
+                    try:
+                        xhs_storage.write_markdown_files(conn, nid)
+                        count += 1
+                    except Exception:
+                        pass
+                print(f"[OK] 已导出 {count}/{len(rows)} 篇 Markdown（用户 {user_id}）")
+            else:
+                print("[ERR] --format md 需配合 --note <id> 或 --user <user_id>", file=sys.stderr)
                 return 1
-            row = xhs_storage.get_note(conn, args.note)
-            if not row:
-                print(f"[ERR] 笔记 {args.note} 不在 DB", file=sys.stderr)
-                return 1
-            path = xhs_storage.write_markdown(conn, args.note)
-            title = row["title"] or "(无标题)"
-            print(f"[OK] 《{title}》已导出 Markdown")
-            print(f"     文件: {path}")
-            summary = xhs_storage.render_update_summary(conn, args.note)
-            if summary:
-                print(f"     内容: {summary}")
         elif args.format == "json":
             total = conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
-            path = xhs_storage.write_json(conn)
-            print(f"[OK] 已导出 JSON（共 {total} 条笔记）")
+            path = xhs_storage.write_json(conn, user_id=user_id)
+            label = f"（用户 {user_id}）" if user_id else f"（共 {total} 条笔记）"
+            print(f"[OK] 已导出 JSON{label}")
             print(f"     文件: {path}")
         elif args.format == "xlsx":
             total = conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
             try:
-                path = xhs_storage.write_xlsx(conn)
-                print(f"[OK] 已导出 XLSX（共 {total} 条笔记）")
+                path = xhs_storage.write_xlsx(conn, user_id=user_id)
+                label = f"（用户 {user_id}）" if user_id else f"（共 {total} 条笔记）"
+                print(f"[OK] 已导出 XLSX{label}")
                 print(f"     文件: {path}")
             except ImportError:
                 return 1
         else:
             total = conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
-            path = xhs_storage.write_csv(conn)
-            print(f"[OK] 已导出 CSV（共 {total} 条笔记）")
-            print(f"     文件: {path}")
+            files = xhs_storage.write_csv(conn, user_id=user_id)
+            label = f"（用户 {user_id}）" if user_id else f"（共 {total} 条笔记）"
+            print(f"[OK] 已导出 CSV{label}")
+            for f in files:
+                print(f"     {f}")
         return 0
     finally:
         conn.close()
@@ -807,7 +881,7 @@ def cmd_export(args: argparse.Namespace) -> int:
 
 def cmd_feed(args: argparse.Namespace) -> int:
     """推荐流 / 分类流浏览，每页入库并打印摘要。"""
-    hb = _Heartbeat()
+    hb = Heartbeat()
     try:
         with fetch_session(args) as (fetcher, conn):
             category_key = getattr(args, "category", "recommend")
@@ -844,12 +918,12 @@ def cmd_feed(args: argparse.Namespace) -> int:
 
 def cmd_crawl_feed(args: argparse.Namespace) -> int:
     """长任务版 feed：cursor 落库 + --resume 续抓。"""
-    hb = _Heartbeat()
+    hb = Heartbeat()
     try:
         with fetch_session(args) as (fetcher, conn):
             category_key = getattr(args, "category", "recommend")
             category = xhs_config.FEED_CATEGORIES.get(category_key, "homefeed_recommend")
-            task_id = f"feed:{category_key}"
+            task_id = f"feed:{category_key}:{fetcher.account.alias}"
             cursor_score = ""
             start_page = 1
             if args.resume:
@@ -907,7 +981,7 @@ def cmd_crawl_feed(args: argparse.Namespace) -> int:
 
 def cmd_download(args: argparse.Namespace) -> int:
     """下载某笔记的图片/视频到 data/media/<note_id>/。不需要签名（直接从 CDN 拉）。"""
-    hb = _Heartbeat()
+    hb = Heartbeat()
     try:
         conn = xhs_storage.connect()
         try:
@@ -938,7 +1012,7 @@ def cmd_download(args: argparse.Namespace) -> int:
             # 重新渲染 MD（会自动用本地路径）
             try:
                 md = xhs_storage.write_markdown(conn, args.note_id)
-                print(f"     MD 已更新（图片/视频改用本地路径）: {md.name}")
+                print(f"     MD 已更新（图片/视频改用本地路径）: {md.parent.name}/{md.name}")
             except Exception:
                 pass
             return 0 if n_err == 0 else 2
@@ -950,10 +1024,10 @@ def cmd_download(args: argparse.Namespace) -> int:
 
 def cmd_crawl_search(args: argparse.Namespace) -> int:
     """长任务版 search：多页 + cursor 落库 + --resume 续抓"""
-    hb = _Heartbeat()
+    hb = Heartbeat()
     try:
         with fetch_session(args) as (fetcher, conn):
-            task_id = f"search:{args.keyword}"
+            task_id = f"search:{args.keyword}:{fetcher.account.alias}"
             # 恢复
             start_page = 1
             if args.resume:
@@ -1016,70 +1090,70 @@ def cmd_crawl_search(args: argparse.Namespace) -> int:
 
 def cmd_crawl_user(args: argparse.Namespace) -> int:
     """长任务版 user：cursor 落库 + --resume"""
-    hb = _Heartbeat()
+    hb = Heartbeat()
     try:
         with fetch_session(args) as (fetcher, conn):
-            task_id = f"user:{args.user_id}"
-        cursor = ""
-        if args.resume:
-            st = xhs_storage.get_crawl_state(conn, task_id)
-            if st:
-                cursor = st["cursor"] or ""
-                print(f"[RESUME] 从 cursor={cursor[:30]} 继续", file=sys.stderr)
+            task_id = f"user:{args.user_id}:{fetcher.account.alias}"
+            cursor = ""
+            if args.resume:
+                st = xhs_storage.get_crawl_state(conn, task_id)
+                if st:
+                    cursor = st["cursor"] or ""
+                    print(f"[RESUME] 从 cursor={cursor[:30]} 继续", file=sys.stderr)
 
-        # 先入库用户信息
-        try:
-            info = fetch_user_info(fetcher, args.user_id)
-            if info:
-                info["user_id"] = args.user_id
-                xhs_storage.upsert_user(conn, _normalize_user(info))
-                conn.commit()
-                print(f"[USER] {info.get('nickname','?')} 粉丝 {info.get('fans','?')}", file=sys.stderr)
-        except Exception as e:
-            print(f"[USER] 用户信息抓取失败（继续抓笔记）：{e}", file=sys.stderr)
+            # 先入库用户信息
+            try:
+                info = fetch_user_info(fetcher, args.user_id)
+                if info:
+                    info["user_id"] = args.user_id
+                    xhs_storage.upsert_user(conn, _normalize_user(info))
+                    conn.commit()
+                    print(f"[USER] {info.get('nickname','?')} 粉丝 {info.get('fans','?')}", file=sys.stderr)
+            except Exception as e:
+                print(f"[USER] 用户信息抓取失败（继续抓笔记）：{e}", file=sys.stderr)
 
-        total = 0
-        try:
-            for page in range(1, args.max_pages + 1):
-                data = fetch_user_notes(fetcher, args.user_id, cursor=cursor)
-                items = data.get("notes") or []
-                if not items:
-                    break
-                for item in items:
-                    item.setdefault("xsec_source", "pc_user")
-                    note = _normalize_note({
-                        "id": item.get("note_id") or item.get("id"),
-                        "xsec_token": item.get("xsec_token", ""),
-                        "xsec_source": "pc_user",
-                        "note_card": item,
-                    })
-                    if not note["note_id"]:
-                        continue
-                    note["user_id"] = args.user_id
-                    xhs_storage.upsert_note(conn, note)
-                    _try_upsert_user_from_note(note, conn)
-                    total += 1
-                    xhs_media.post_process_note(note, conn, args)
-                conn.commit()
-                cursor = data.get("cursor", "")
+            total = 0
+            try:
+                for page in range(1, args.max_pages + 1):
+                    data = fetch_user_notes(fetcher, args.user_id, cursor=cursor)
+                    items = data.get("notes") or []
+                    if not items:
+                        break
+                    for item in items:
+                        item.setdefault("xsec_source", "pc_user")
+                        note = _normalize_note({
+                            "id": item.get("note_id") or item.get("id"),
+                            "xsec_token": item.get("xsec_token", ""),
+                            "xsec_source": "pc_user",
+                            "note_card": item,
+                        })
+                        if not note["note_id"]:
+                            continue
+                        note["user_id"] = args.user_id
+                        xhs_storage.upsert_note(conn, note)
+                        _try_upsert_user_from_note(note, conn)
+                        total += 1
+                        xhs_media.post_process_note(note, conn, args)
+                    conn.commit()
+                    cursor = data.get("cursor", "")
+                    xhs_storage.update_crawl_state(
+                        conn, task_id, "user", args.user_id,
+                        cursor, "running", "",
+                    )
+                    print(f"  [page {page}] +{len(items)} 入库，累计 {total}", file=sys.stderr)
+                    if not data.get("has_more") or not cursor:
+                        break
                 xhs_storage.update_crawl_state(
-                    conn, task_id, "user", args.user_id,
-                    cursor, "running", "",
+                    conn, task_id, "user", args.user_id, cursor, "completed", "",
                 )
-                print(f"  [page {page}] +{len(items)} 入库，累计 {total}", file=sys.stderr)
-                if not data.get("has_more") or not cursor:
-                    break
-            xhs_storage.update_crawl_state(
-                conn, task_id, "user", args.user_id, cursor, "completed", "",
-            )
-            print(f"[OK] crawl-user {args.user_id} 完成：{total} 条新增")
-            return 0
-        except FatalRiskError as e:
-            xhs_storage.update_crawl_state(
-                conn, task_id, "user", args.user_id, cursor, "paused", str(e),
-            )
-            print(f"[PAUSED] cursor={cursor[:30]} 因风控暂停：{e}\n下次用 --resume 继续。", file=sys.stderr)
-            return 2
+                print(f"[OK] crawl-user {args.user_id} 完成：{total} 条新增")
+                return 0
+            except FatalRiskError as e:
+                xhs_storage.update_crawl_state(
+                    conn, task_id, "user", args.user_id, cursor, "paused", str(e),
+                )
+                print(f"[PAUSED] cursor={cursor[:30]} 因风控暂停：{e}\n下次用 --resume 继续。", file=sys.stderr)
+                return 2
     finally:
         hb.stop()
 
@@ -1090,7 +1164,7 @@ def cmd_crawl_user(args: argparse.Namespace) -> int:
 
 def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--sign-mode", choices=["auto", "embed-js", "playwright", "py-port"], default="auto")
-    p.add_argument("--speed-mode", choices=list(xhs_config.SPEED_PROFILES.keys()), default="normal")
+    p.add_argument("--speed-mode", choices=list(xhs_config.SPEED_PROFILES.keys()), default="paranoid")
     p.add_argument("--proxy", default=None)
     p.add_argument("--account", default=None, help="指定账号别名")
 
@@ -1107,10 +1181,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_login = sub.add_parser("login", help="获取并保存 cookie")
     p_login.add_argument("--prefer",
-                          choices=["auto", "win-edge", "win-chrome", "rookie",
+                          choices=["auto", "rookie", "edge", "chrome", "native",
+                                   "native-edge", "native-chrome",
                                    "wsl-edge", "wsl-edge-cdp",
                                    "wsl-chrome", "wsl-chrome-cdp", "qr", "manual"],
-                          default="auto")
+                          default="auto",
+                          help="登录方式（auto=自动选择最优）")
     p_login.add_argument("--name", default=None, help="账号别名（保存到 data/accounts/<name>.json）")
     p_login.set_defaults(func=cmd_login)
 
@@ -1175,6 +1251,18 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common(p_cu)
     p_cu.set_defaults(func=cmd_crawl_user)
 
+    p_par = sub.add_parser("crawl-parallel", help="多账号并行爬取（每个账号一个任务同时跑）")
+    p_par.add_argument("--users", nargs="+", default=[], help="用户 ID 列表（每个账号爬一个用户）")
+    p_par.add_argument("--keywords", nargs="+", default=[], help="关键词列表（每个账号搜一个关键词）")
+    p_par.add_argument("--max-pages", type=int, default=5)
+    p_par.add_argument("--download", action="store_true", default=True, help="自动下载媒体（默认开启）")
+    p_par.add_argument("--analyze", action="store_true", default=True, help="自动内容分析（默认开启）")
+    p_par.add_argument("--no-download", action="store_false", dest="download", help="跳过下载")
+    p_par.add_argument("--no-analyze", action="store_false", dest="analyze", help="跳过分析")
+    p_par.add_argument("--sign-mode", choices=["auto", "embed-js", "playwright", "py-port"], default="auto")
+    p_par.add_argument("--speed-mode", choices=list(xhs_config.SPEED_PROFILES.keys()), default="paranoid")
+    p_par.set_defaults(func=cmd_crawl_parallel)
+
     p_clean = sub.add_parser("cleanup", help="数据清理：孤儿媒体、过期缓存")
     p_clean.add_argument("--dry-run", action="store_true", help="只显示要删除的内容")
     p_clean.add_argument("--max-cache-days", type=int, default=30, help="清理 N 天前的空搜索缓存（默认 30）")
@@ -1191,9 +1279,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_exp = sub.add_parser("export", help="从 DB 导出 MD/CSV/JSON/XLSX")
     p_exp.add_argument("--format", choices=["md", "csv", "json", "xlsx"], default="csv")
     p_exp.add_argument("--note", default=None, help="单篇 MD 时指定 note_id")
+    p_exp.add_argument("--user", default=None, help="按 user_id 过滤（CSV/JSON/XLSX）")
     p_exp.set_defaults(func=cmd_export)
 
     p_acct = sub.add_parser("accounts", help="查看多账号状态")
+    p_acct.add_argument("--set-speed", default=None, metavar="alias=mode",
+                         help="设置账号专属速率（如 --set-speed account3=slow）")
     p_acct.set_defaults(func=cmd_accounts)
 
     p_stats = sub.add_parser("stats", help="请求统计")
@@ -1226,6 +1317,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_rc = sub.add_parser("refresh-cookies", help="批量检查并刷新所有账号的 cookie")
     p_rc.add_argument("--force", action="store_true", help="强制重新登录（即使 cookie 未过期）")
     p_rc.set_defaults(func=cmd_refresh_cookies)
+
+    p_ka = sub.add_parser("keepalive", help="多账号 Cookie 自动保活")
+    p_ka.add_argument("--daemon", action="store_true", help="守护进程模式（持续运行）")
+    p_ka.add_argument("--interval", type=int, default=0,
+                       help="守护进程检查间隔（秒，默认 3600 = 1小时）")
+    p_ka.add_argument("--account", default=None, help="只保活指定账号（默认所有）")
+    p_ka.add_argument("--force", action="store_true", help="强制执行保活（即使 cookie 当前有效）")
+    p_ka.set_defaults(func=cmd_keepalive)
 
     p_az = sub.add_parser("analyze", help="评论情感分析 / 话题聚类")
     p_az.add_argument("--type", choices=["sentiment", "topics"], default="topics",

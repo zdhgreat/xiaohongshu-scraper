@@ -138,8 +138,8 @@ class TestImageAnalysisDB:
 # ---------------------------------------------------------------------------
 
 class TestImageMarkdown:
-    def test_render_with_image_analysis(self, db_conn):
-        """MD 渲染应包含图片分析段落。"""
+    def test_render_with_image_analysis(self, db_conn, tmp_path, monkeypatch):
+        """多文件导出时 images.md 应包含图片分析段落。"""
         note = {"note_id": "md_img_1", "title": "旅游攻略", "type": "note"}
         xhs_storage.upsert_note(db_conn, note)
         xhs_storage.update_image_analysis(
@@ -149,23 +149,28 @@ class TestImageMarkdown:
             mermaid="graph LR\n    A[成都] --> B[九寨沟]",
         )
 
-        md = xhs_storage.render_markdown(db_conn, "md_img_1")
-        assert "### 图片分析" in md
-        assert "#### AI 描述" in md
-        assert "这是一篇旅游攻略" in md
-        assert "#### 图片文字" in md
-        assert "Day1 成都→九寨沟" in md
-        assert "#### 路线图 / 流程图" in md
-        assert "```mermaid" in md
-        assert "graph LR" in md
+        monkeypatch.setattr(xhs_storage, "OUTPUT_DIR", tmp_path)
+        files = xhs_storage.write_markdown_files(db_conn, "md_img_1")
+        # 找到 images.md
+        images_md = next((f for f in files if f.name == "images.md"), None)
+        assert images_md is not None, f"images.md not found in {files}"
+        content = images_md.read_text(encoding="utf-8")
+        assert "AI 描述" in content
+        assert "这是一篇旅游攻略" in content
+        assert "图片文字" in content
+        assert "Day1 成都→九寨沟" in content
+        assert "```mermaid" in content
+        assert "graph LR" in content
 
-    def test_render_without_image_analysis(self, db_conn):
-        """无图片分析数据时 MD 不应包含图片分析段落。"""
+    def test_render_without_image_analysis(self, db_conn, tmp_path, monkeypatch):
+        """无图片分析数据时不应生成 images.md。"""
         note = {"note_id": "md_img_2", "title": "普通笔记", "type": "note"}
         xhs_storage.upsert_note(db_conn, note)
 
-        md = xhs_storage.render_markdown(db_conn, "md_img_2")
-        assert "### 图片分析" not in md
+        monkeypatch.setattr(xhs_storage, "OUTPUT_DIR", tmp_path)
+        files = xhs_storage.write_markdown_files(db_conn, "md_img_2")
+        images_md = next((f for f in files if f.name == "images.md"), None)
+        assert images_md is None, "images.md should not be generated without image analysis"
 
 
 # ---------------------------------------------------------------------------
@@ -173,8 +178,8 @@ class TestImageMarkdown:
 # ---------------------------------------------------------------------------
 
 class TestImageCSV:
-    def test_csv_has_image_headers(self, db_conn, tmp_path):
-        """CSV 应包含 26 列，含图片分析列。"""
+    def test_csv_has_correct_headers(self, db_conn, tmp_path):
+        """CSV 应包含精简后的 14 列。"""
         note = {"note_id": "csv_img_1", "title": "CSV测试", "type": "note"}
         xhs_storage.upsert_note(db_conn, note)
         xhs_storage.update_image_analysis(
@@ -184,12 +189,11 @@ class TestImageCSV:
         )
 
         csv_path = tmp_path / "test.csv"
-        xhs_storage.write_csv(db_conn, path=csv_path)
+        files = xhs_storage.write_csv(db_conn, path=csv_path)
 
         content = csv_path.read_text(encoding="utf-8-sig")
         lines = content.strip().split("\n")
         headers = lines[0].split(",")
-        assert len(xhs_storage.CSV_HEADERS) == 26
-        assert "图片OCR文字" in xhs_storage.CSV_HEADERS
-        assert "图片分析摘要" in xhs_storage.CSV_HEADERS
-        assert "图片Mermaid图" in xhs_storage.CSV_HEADERS
+        assert len(xhs_storage.CSV_HEADERS) == 14
+        assert "标题" in xhs_storage.CSV_HEADERS
+        assert "正文摘要" in xhs_storage.CSV_HEADERS

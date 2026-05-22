@@ -18,13 +18,14 @@ import base64
 import json
 import re
 import sys
-import threading
 from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA = ROOT / "data"
 CONFIG_PATH = DATA / "image_config.json"
+
+from xhs_config import Heartbeat
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "image_mode": "auto",           # auto / none / local / vision
@@ -188,7 +189,7 @@ def find_local_images(note_id: str, conn) -> list[Path]:
 # ---------------------------------------------------------------------------
 
 def _do_ocr(image_paths: list[Path]) -> str:
-    """对所有图片做 OCR，返回合并的文字。"""
+    """对所有图片做 OCR，返回合并的文字。复用 OCR 实例。"""
     if not image_paths:
         return ""
     try:
@@ -814,7 +815,14 @@ def analyze_images(
     if all_steps and cache_dir.exists():
         try:
             import shutil
-            shutil.rmtree(cache_dir, ignore_errors=True)
+            import time
+            for _attempt in range(3):
+                try:
+                    shutil.rmtree(cache_dir)
+                    break
+                except Exception:
+                    if _attempt < 2:
+                        time.sleep(1.0)
         except Exception:
             pass
 
@@ -836,23 +844,6 @@ def _msg(text: str) -> None:
     print(f"[IMAGE] {text}", file=sys.stderr, flush=True)
 
 
-class _Heartbeat:
-    """后台守护线程，定期输出到 stderr 防止连接被静默 kill。"""
-    def __init__(self, interval: float = 15.0):
-        self.interval = interval
-        self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-
-    def _run(self):
-        while not self._stop.wait(self.interval):
-            print("[heartbeat] 任务仍在运行...", file=sys.stderr, flush=True)
-
-    def stop(self):
-        self._stop.set()
-        self._thread.join(timeout=1.0)
-
-
 # ---------------------------------------------------------------------------
 # CLI command handlers (moved from xhs.py)
 # ---------------------------------------------------------------------------
@@ -862,7 +853,7 @@ def cmd_analyze_images(args) -> int:
     import xhs_storage
 
     # 心跳：防止长耗时任务被 Kimi 2.6 等平台静默 kill
-    hb = _Heartbeat()
+    hb = Heartbeat()
     conn = xhs_storage.connect()
     try:
         row = xhs_storage.get_note(conn, args.note_id)
@@ -971,7 +962,7 @@ def cmd_analyze_images(args) -> int:
         # 重新渲染 MD
         try:
             md = xhs_storage.write_markdown(conn, args.note_id)
-            print(f"     MD 已更新: {md.name}")
+            print(f"     MD 已更新: {md.parent.name}/{md.name}")
         except Exception:
             pass
 

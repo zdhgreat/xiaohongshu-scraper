@@ -11,10 +11,10 @@
 | 评论采集 | 主评论 + 子评论分页，自动入库 |
 | 媒体下载 | 图片自动下载 + 视频流式下载，按 `博主名/笔记标题/` 组织 |
 | 图片分析 | OCR 文字提取 + AI 视觉描述 + Mermaid 路线图/流程图 |
-| 视频分析 | 语音转文字 + 关键帧 OCR + AI 摘要 |
+| 视频分析 | 语音转文字 + OCR 纠错 + 关键帧 OCR + AI 摘要 |
 | 批量抓取 | 断点续抓 + `--download` + `--analyze` 自动化 |
 | 多账号 | 账号轮换 + 日抓上限 + cookie 自动刷新 |
-| 导出 | Markdown（含图片/视频/评论/分析）+ CSV（26 列，飞书可直接导入） |
+| 导出 | Markdown（按博主分目录）+ CSV（26 列，飞书可直接导入） |
 
 ## 快速开始
 
@@ -134,7 +134,8 @@ xiaohongshu_scraper_skill/
     ├── image_config.json      # 图片分析配置
     ├── video_config.json      # 视频分析配置
     ├── media/                 # 媒体文件：<博主名>/<笔记标题>/
-    └── output/                # MD + CSV
+    │   └── <博主>/<标题>/keyframes/  # 视频关键帧（保留）
+    └── output/                # 按博主分目录：<博主名>/<标题>.md
 ```
 
 ## 图片分析
@@ -171,10 +172,13 @@ Layer 3: Mermaid 图表    →  自动生成路线图/流程图（嵌入 Markdow
 ## 视频分析
 
 ```
-Layer 1: 语音转文字（faster-whisper，本地运行）
+Layer 1: 语音转文字（faster-whisper，base 模型）
 Layer 2: 关键帧 OCR（rapidocr，提取画面文字）
-Layer 3: AI 摘要（none / local / ollama / openai / mcp 五档）
+Layer 3: OCR 纠错转录（用 OCR 文字纠正 Whisper 同音字/英文错误）
+Layer 4: AI 摘要（none / local / ollama / openai / mcp 五档）
 ```
+
+OCR 画面文字作为地面真相，自动纠正 Whisper 的中文同音字和英文术语错误（如 Cloud→Claude）。
 
 需要 ffmpeg（系统级工具，需手动安装）。
 
@@ -232,6 +236,8 @@ python scripts/xhs.py update-js --dry-run # 只检查不覆盖
 | Ollama 不可用 | 确认已安装 + 正在运行：`ollama serve` |
 | API 调用失败 | 运行 `setup-wizard` 重新配置，自动验证连接 |
 | ffmpeg 未安装 | 视频分析不可用，其他功能正常。Windows: `winget install Gyan.FFmpeg` |
+| `database is locked` | 前一个进程未退出，等待或重启；v1.6.0 已有 PID 锁自动清理 |
+| 转录错误多 | 确保配置了 OpenAI/Ollama 后端以启用 OCR 纠错；无 LLM 时跳过纠错 |
 
 ## 风险
 

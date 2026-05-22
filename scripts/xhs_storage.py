@@ -6,7 +6,6 @@ MVP 用 4 张表：notes / users / search_cache / crawl_state。
 
 from __future__ import annotations
 
-import atexit
 import csv
 import json
 import os
@@ -18,7 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-from xhs_config import DB_PATH, MEDIA_DIR, OUTPUT_DIR, note_media_dir
+from xhs_config import DB_PATH, MEDIA_DIR, OUTPUT_DIR, note_media_dir, sanitize_filename
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS notes (
@@ -133,84 +132,13 @@ def _migrate(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-# ---------------------------------------------------------------------------
-# PID 文件锁：防止多个命令并发写入同一数据库
-# ---------------------------------------------------------------------------
-
-_PID_FILE = DB_PATH.with_suffix('.pid')
-
-
-def _check_stale_lock() -> None:
-    """检查并清理残留的数据库锁（来自上一个被 kill 的进程）。"""
-    if not _PID_FILE.exists():
-        return
-    try:
-        old_pid = int(_PID_FILE.read_text().strip())
-    except (ValueError, OSError):
-        _PID_FILE.unlink(missing_ok=True)
-        return
-    if _is_pid_alive(old_pid):
-        print(f"[DB] 另一个 xhs 进程 (PID {old_pid}) 正在使用数据库，等待释放...",
-              file=sys.stderr)
-    else:
-        # 进程已死 → 残留锁，自动清理
-        print(f"[DB] 清理残留锁（PID {old_pid} 已退出）", file=sys.stderr)
-        _PID_FILE.unlink(missing_ok=True)
-        time.sleep(1.0)  # 等 OS 释放文件锁
-
-
-def _is_pid_alive(pid: int) -> bool:
-    """跨平台检查进程是否存活。"""
-    if sys.platform == "win32":
-        # Windows: 用 ctypes OpenProcess 检查
-        try:
-            import ctypes
-            kernel32 = ctypes.windll.kernel32
-            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-            if handle:
-                kernel32.CloseHandle(handle)
-                return True
-            return False
-        except Exception:
-            # fallback: 假设存活（保守策略）
-            return True
-    else:
-        # Unix: os.kill(pid, 0) 检查
-        try:
-            os.kill(pid, 0)
-            return True
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True  # 进程存在但无权发信号
-
-
-def _register_lock() -> None:
-    """注册当前进程为数据库持有者。"""
-    _PID_FILE.write_text(str(os.getpid()))
-
-
-def _release_lock() -> None:
-    """释放数据库锁（当前进程是持有者时才删除）。"""
-    try:
-        current = int(_PID_FILE.read_text().strip())
-        if current == os.getpid():
-            _PID_FILE.unlink(missing_ok=True)
-    except (ValueError, OSError):
-        _PID_FILE.unlink(missing_ok=True)
-
-
 def connect() -> sqlite3.Connection:
-    # 1. 检查并清理残留锁（来自被 kill 的上一个进程）
-    _check_stale_lock()
-
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    # busy_timeout: 写冲突时最多等 30 秒，给残留进程更多释放时间
+    # busy_timeout: 多进程并发写冲突时排队等 30 秒
     conn.execute("PRAGMA busy_timeout = 30000")
-    # WAL 模式允许读写并发；先查再设，避免重复执行
+    # WAL 模式允许并发读 + 串行写；先查再设，避免重复执行
     jm = conn.execute("PRAGMA journal_mode").fetchone()
     if jm is None or jm[0] != "wal":
         conn.execute("PRAGMA journal_mode=WAL")
@@ -219,12 +147,8 @@ def connect() -> sqlite3.Connection:
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     except Exception:
         pass
-    # 2. 注册当前进程为数据库持有者
-    _register_lock()
     conn.executescript(SCHEMA)
     _migrate(conn)
-    # 3. 注册 atexit 清理 PID 文件（进程正常退出或未捕获异常时触发）
-    atexit.register(_release_lock)
     return conn
 
 
@@ -248,6 +172,7 @@ def upsert_note(conn: sqlite3.Connection, note: dict[str, Any]) -> None:
         if existing and existing["content_hash"] == content_hash:
             return  # 无变更，跳过
 
+    # 注意：新增字段时必须同步更新下方 ON CONFLICT DO UPDATE SET 子句
     cols = (
         "note_id user_id title description type liked_count collected_count "
         "comment_count share_count ip_location topics published_at "
@@ -282,6 +207,8 @@ def upsert_note(conn: sqlite3.Connection, note: dict[str, Any]) -> None:
         json.dumps(note.get("raw", {}), ensure_ascii=False),
         content_hash,
     ]
+    # 防御性检查：确保 cols 数量与 values 数量一致
+    assert len(cols) == len(values), f"upsert_note: cols({len(cols)}) != values({len(values)})"
     placeholders = ",".join("?" * len(cols))
     # 用 INSERT...ON CONFLICT，避免 INSERT OR REPLACE 把已有字段清成空
     conn.execute(
@@ -477,7 +404,7 @@ def count_comments(conn: sqlite3.Connection, note_id: str) -> tuple[int, int]:
 
 def iter_notes(
     conn: sqlite3.Connection, user_id: str | None = None
-) -> Iterable[sqlite3.Row]:
+) -> Iterable[dict]:
     if user_id:
         cur = conn.execute(
             "SELECT * FROM notes WHERE user_id = ? ORDER BY published_at DESC",
@@ -485,42 +412,61 @@ def iter_notes(
         )
     else:
         cur = conn.execute("SELECT * FROM notes ORDER BY published_at DESC")
-    yield from cur
+    for row in cur:
+        yield dict(row)
 
 
-def render_markdown(conn: sqlite3.Connection, note_id: str) -> str:
+def _note_context(conn: sqlite3.Connection, note_id: str, md_path: Path | None = None) -> dict:
+    """提取渲染所需的公共数据，避免多个 _render_* 重复查库。"""
     note = get_note(conn, note_id)
     if not note:
         raise FileNotFoundError(f"note {note_id} not in DB")
     user = get_user(conn, note["user_id"]) if note["user_id"] else None
     raw = json.loads(note["raw_json"] or "{}")
-
     nickname = (user["nickname"] if user else "") or raw.get("user", {}).get("nickname", "")
     topics = json.loads(note["topics"] or "[]")
     topic_str = " ".join(f"#{t}" for t in topics) if topics else "—"
 
-    # 优先使用本地化媒体，否则用远程 URL
-    # 查找本地文件（兼容新旧两种目录结构）
+    # 计算从 MD 文件到 media 根目录的相对前缀
+    media_rel_prefix = ".."
+    if md_path is not None:
+        try:
+            depth = len(md_path.relative_to(OUTPUT_DIR).parts) - 1
+            media_rel_prefix = "/".join([".."] * (depth + 1))
+        except ValueError:
+            pass
+
     media_dir = _find_media_dir(note_id, conn)
     local_images = sorted(media_dir.glob("img_*")) if media_dir.exists() else []
     local_video = next(iter(media_dir.glob("video.*")), None) if media_dir.exists() else None
-    if local_images:
-        images = [str(Path("..") / media_dir.relative_to(OUTPUT_DIR.parent) / p.name).replace("\\", "/") for p in local_images]
-    else:
-        images = _extract_images(raw)
-    if local_video:
-        video_url = str(Path("..") / media_dir.relative_to(OUTPUT_DIR.parent) / local_video.name).replace("\\", "/")
-    else:
-        video_url = _extract_video_url(raw)
 
+    images = _extract_images(raw)
+    if local_images:
+        images = [str(Path(media_rel_prefix) / media_dir.relative_to(OUTPUT_DIR.parent) / p.name).replace("\\", "/") for p in local_images]
+    video_url = _extract_video_url(raw)
+    if local_video:
+        video_url = str(Path(media_rel_prefix) / media_dir.relative_to(OUTPUT_DIR.parent) / local_video.name).replace("\\", "/")
+
+    return {
+        "note": note, "user": user, "raw": raw, "nickname": nickname,
+        "topics": topics, "topic_str": topic_str, "media_dir": media_dir,
+        "media_rel_prefix": media_rel_prefix,
+        "images": images, "video_url": video_url,
+        "local_video": local_video, "local_images": local_images,
+    }
+
+
+def _render_index(conn: sqlite3.Connection, ctx: dict) -> str:
+    """渲染 index.md：元数据 + 正文 + 图片 + 视频基本信息。"""
+    note = ctx["note"]
     lines = [
         f"# {note['title'] or '(无标题)'}",
         "",
-        f"- **作者**: {nickname} (@{note['user_id']})",
+        f"- **作者**: {ctx['nickname']} (@{note['user_id']})",
         f"- **发布时间**: {note['published_at'] or '—'}",
         f"- **IP属地**: {note['ip_location'] or '—'}",
         f"- **互动**: 赞 {note['liked_count']} | 藏 {note['collected_count']} | 评 {note['comment_count']} | 分享 {note['share_count']}",
-        f"- **话题**: {topic_str}",
+        f"- **话题**: {ctx['topic_str']}",
         f"- **类型**: {note['type']}",
         f"- **笔记链接**: https://www.xiaohongshu.com/explore/{note['note_id']}",
         "",
@@ -529,108 +475,245 @@ def render_markdown(conn: sqlite3.Connection, note_id: str) -> str:
         note["description"] or "(无正文)",
         "",
     ]
-    if images:
+    if ctx["images"]:
         lines.append("## 图片")
         lines.append("")
         md_title = (note['title'] or '(无标题)').replace('[', '(').replace(']', ')')
-        for i, url in enumerate(images, 1):
+        for i, url in enumerate(ctx["images"], 1):
             lines.append(f"![{md_title}·图{i}]({url})")
         lines.append("")
 
-    # 图片分析结果
-    image_summary = note["image_summary"] or ""
-    image_ocr = note["image_ocr_text"] or ""
-    image_mermaid = note["image_mermaid"] or ""
-    if image_summary or image_ocr or image_mermaid:
-        lines.append("### 图片分析")
-        lines.append("")
-        if image_summary:
-            lines.append("#### AI 描述")
-            lines.append("")
-            lines.append(image_summary)
-            lines.append("")
-        if image_ocr:
-            lines.append("#### 图片文字")
-            lines.append("")
-            lines.append(image_ocr)
-            lines.append("")
-        if image_mermaid:
-            lines.append("#### 路线图 / 流程图")
-            lines.append("")
-            lines.append("```mermaid")
-            lines.append(image_mermaid)
-            lines.append("```")
-            lines.append("")
-    if video_url:
+    # 视频基本信息（不含分析内容）
+    if ctx["video_url"]:
         lines.append("## 视频")
         lines.append("")
-        # 封面图
-        cover = note["cover_url"] or _extract_cover_url(raw) or ""
+        cover = note["cover_url"] or _extract_cover_url(ctx["raw"]) or ""
         if cover:
-            # 优先本地封面
-            local_cover = next(iter(media_dir.glob("cover.*")), None) if media_dir.exists() else None
+            local_cover = next(iter(ctx["media_dir"].glob("cover.*")), None) if ctx["media_dir"].exists() else None
             if local_cover:
-                cover_ref = str(Path("..") / media_dir.relative_to(OUTPUT_DIR.parent) / local_cover.name).replace("\\", "/")
+                cover_ref = str(Path(ctx["media_rel_prefix"]) / ctx["media_dir"].relative_to(OUTPUT_DIR.parent) / local_cover.name).replace("\\", "/")
             else:
                 cover_ref = cover
             lines.append(f"![封面]({cover_ref})")
             lines.append("")
-        # 时长
         duration = note["video_duration"] or 0
         if duration:
             mins, secs = divmod(duration, 60)
             lines.append(f"- **时长**: {mins:02d}:{secs:02d}")
-        lines.append(f"[视频链接]({video_url})")
-        # 本地视频文件
-        if local_video:
-            lines.append(f"- **本地文件**: `{local_video.name}`")
+        lines.append(f"[视频链接]({ctx['video_url']})")
+        if ctx["local_video"]:
+            lines.append(f"- **本地文件**: `{ctx['local_video'].name}`")
         lines.append("")
-        # 视频分析结果
-        transcript = note["video_transcript"] or ""
-        ocr_text = note["video_ocr_text"] or ""
-        summary = note["video_summary"] or ""
-        if summary:
-            lines.append("### 视频摘要")
-            lines.append("")
-            lines.append(summary)
-            lines.append("")
-        if transcript:
-            lines.append("### 语音转录")
-            lines.append("")
-            lines.append(transcript)
-            lines.append("")
-        if ocr_text:
-            lines.append("### 画面文字")
-            lines.append("")
-            lines.append(ocr_text)
-            lines.append("")
 
-    # 评论区
-    main_n, sub_n = count_comments(conn, note_id)
+    # 链接提示（指向其他子文件）
+    links = []
+    note_id = note["note_id"]
+    transcript = note["video_transcript"] or ""
+    ocr_text = note["video_ocr_text"] or ""
+    summary = note["video_summary"] or ""
+    image_summary = note["image_summary"] or ""
+    image_ocr = note["image_ocr_text"] or ""
+    image_mermaid = note["image_mermaid"] or ""
+    main_n, _ = count_comments(conn, note_id)
+
+    if summary or transcript or ocr_text:
+        links.append("[视频分析](video.md)")
+    if image_summary or image_ocr or image_mermaid:
+        links.append("[图片分析](images.md)")
     if main_n:
-        lines.append(f"## 评论 ({main_n} 主 + {sub_n} 回复)")
+        links.append(f"[评论](comments.md) ({main_n} 条)")
+
+    if links:
+        lines.append("---")
         lines.append("")
-        for c in iter_comments(conn, note_id):
-            indent = "" if c["parent_id"] == "" else "  "
-            head = f"**{c['nickname']}** ({c['ip_location'] or '?'}, 赞 {c['like_count']})"
-            lines.append(f"{indent}- {head}: {c['content']}")
+        for link in links:
+            lines.append(f"- {link}")
         lines.append("")
+
     return "\n".join(lines)
 
 
+def _render_video_section(ctx: dict) -> str | None:
+    """渲染 video.md：摘要 + 转录 + OCR。无视频内容时返回 None。"""
+    note = ctx["note"]
+    transcript = note["video_transcript"] or ""
+    ocr_text = note["video_ocr_text"] or ""
+    summary = note["video_summary"] or ""
+
+    if not (summary or transcript or ocr_text):
+        return None
+
+    title = note['title'] or '(无标题)'
+    lines = [f"# {title} — 视频分析", ""]
+
+    if summary:
+        lines.append("## 摘要")
+        lines.append("")
+        lines.append(summary)
+        lines.append("")
+    elif transcript or ocr_text:
+        lines.append("## 内容提取结果")
+        lines.append("")
+        lines.append(f"- 转录: {len(transcript)} 字")
+        try:
+            ocr_count = len(json.loads(ocr_text))
+        except (json.JSONDecodeError, TypeError):
+            ocr_count = 0
+        lines.append(f"- 画面文字: {ocr_count} 帧")
+        lines.append("")
+
+    if transcript:
+        lines.append("## 语音转录")
+        lines.append("")
+        lines.append(transcript)
+        lines.append("")
+
+    ocr_rendered = _render_video_ocr(ocr_text)
+    if ocr_rendered:
+        lines.append("## 画面文字")
+        lines.append("")
+        lines.append(ocr_rendered)
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def _render_images_section(ctx: dict) -> str | None:
+    """渲染 images.md：AI 描述 + OCR + Mermaid。无图片分析时返回 None。"""
+    note = ctx["note"]
+    image_summary = note["image_summary"] or ""
+    image_ocr = note["image_ocr_text"] or ""
+    image_mermaid = note["image_mermaid"] or ""
+
+    if not (image_summary or image_ocr or image_mermaid):
+        return None
+
+    title = note['title'] or '(无标题)'
+    lines = [f"# {title} — 图片分析", ""]
+
+    if image_summary:
+        lines.append("## AI 描述")
+        lines.append("")
+        lines.append(image_summary)
+        lines.append("")
+    if image_ocr:
+        lines.append("## 图片文字")
+        lines.append("")
+        lines.append(image_ocr)
+        lines.append("")
+    if image_mermaid:
+        lines.append("## 路线图 / 流程图")
+        lines.append("")
+        lines.append("```mermaid")
+        lines.append(image_mermaid)
+        lines.append("```")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def _render_comments_section(conn: sqlite3.Connection, note_id: str) -> str | None:
+    """渲染 comments.md：全部评论。无评论时返回 None。"""
+    main_n, sub_n = count_comments(conn, note_id)
+    if not main_n:
+        return None
+
+    note = get_note(conn, note_id)
+    title = (note["title"] or "(无标题)") if note else note_id
+    lines = [f"# {title} — 评论", ""]
+    lines.append(f"共 {main_n} 条主评论 + {sub_n} 条回复")
+    lines.append("")
+
+    for c in iter_comments(conn, note_id):
+        indent = "" if c["parent_id"] == "" else "  "
+        head = f"**{c['nickname']}** ({c['ip_location'] or '?'}, 赞 {c['like_count']})"
+        lines.append(f"{indent}- {head}: {c['content']}")
+    lines.append("")
+
+    return "\n".join(lines)
+
+
+def write_markdown_files(conn: sqlite3.Connection, note_id: str) -> list[Path]:
+    """为单篇笔记生成子文件目录：index.md + video.md + images.md + comments.md。"""
+    # 博主子目录
+    note = get_note(conn, note_id)
+    author_dir = OUTPUT_DIR
+    if note and note["user_id"]:
+        user = get_user(conn, note["user_id"])
+        nickname = (user["nickname"] if user else "") or ""
+        if nickname:
+            author_dir = OUTPUT_DIR / sanitize_filename(nickname, 30)
+
+    # 笔记子目录
+    slug = _human_filename(conn, note_id, "")
+    note_dir = author_dir / slug
+    note_dir.mkdir(parents=True, exist_ok=True)
+
+    # 公共数据
+    index_path = note_dir / "index.md"
+    ctx = _note_context(conn, note_id, md_path=index_path)
+
+    files = []
+
+    # index.md（必有）
+    index_content = _render_index(conn, ctx)
+    index_path.write_text(index_content, encoding="utf-8")
+    files.append(index_path)
+
+    # video.md（有视频分析时生成）
+    video_content = _render_video_section(ctx)
+    if video_content:
+        path = note_dir / "video.md"
+        path.write_text(video_content, encoding="utf-8")
+        files.append(path)
+
+    # images.md（有图片分析时生成）
+    images_content = _render_images_section(ctx)
+    if images_content:
+        path = note_dir / "images.md"
+        path.write_text(images_content, encoding="utf-8")
+        files.append(path)
+
+    # comments.md（有评论时生成）
+    comments_content = _render_comments_section(conn, note_id)
+    if comments_content:
+        path = note_dir / "comments.md"
+        path.write_text(comments_content, encoding="utf-8")
+        files.append(path)
+
+    return files
+
+
+def _render_video_ocr(ocr_text: str) -> str:
+    """智能渲染视频 OCR：JSON 解析 → 去重 → 噪声过滤。旧数据纯文本直接返回。"""
+    if not ocr_text:
+        return ""
+    try:
+        items = json.loads(ocr_text)
+    except (json.JSONDecodeError, TypeError):
+        return ocr_text  # 旧数据兼容
+
+    seen = set()
+    lines = []
+    for item in items:
+        text = item.get("text", "").strip()
+        if not text or len(text) < 2 or text in seen:
+            continue
+        seen.add(text)
+        lines.append(f"- {text}")
+    return "\n".join(lines) if lines else ""
+
+
 def write_markdown(conn: sqlite3.Connection, note_id: str) -> Path:
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    filename = _human_filename(conn, note_id, ".md")
-    path = OUTPUT_DIR / filename
-    path.write_text(render_markdown(conn, note_id), encoding="utf-8")
-    return path
+    """导出笔记为 MD 子文件目录，返回 index.md 路径。"""
+    files = write_markdown_files(conn, note_id)
+    return files[0]  # index.md
 
 
 def _human_filename(conn: sqlite3.Connection, note_id: str, ext: str) -> str:
-    """生成人类可读的文件名：{note_id}_{作者}_{标题前50字}.ext
+    """生成人类可读的文件名：{标题}_{note_id前8位}.ext
 
-    标题去除特殊字符，空格替换为下划线。
-    无标题时退化到 {note_id}_{描述前50字}.ext。
+    无标题时退化到 {note_id}.ext。
     """
     row = get_note(conn, note_id)
     if not row:
@@ -642,17 +725,10 @@ def _human_filename(conn: sqlite3.Connection, note_id: str, ext: str) -> str:
     # 清理标题：去掉文件名不合法字符
     title = re.sub(r'[<>:"/\\|?*\n\r\t]', '', title)
     title = title.replace(' ', '_')
-    title = title[:50]  # 截断
+    title = title[:70]  # 截断
     if not title:
         return f"{note_id}{ext}"
-    # 加博主名
-    author = ""
-    user = get_user(conn, row["user_id"]) if row["user_id"] else None
-    if user and user["nickname"]:
-        author = re.sub(r'[<>:"/\\|?*\n\r\t]', '', user["nickname"]).replace(' ', '_')[:30]
-    if author:
-        return f"{note_id}_{author}_{title}{ext}"
-    return f"{note_id}_{title}{ext}"
+    return f"{title}_{note_id[:8]}{ext}"
 
 
 def render_update_summary(conn: sqlite3.Connection, note_id: str) -> str:
@@ -710,92 +786,107 @@ def render_update_summary(conn: sqlite3.Connection, note_id: str) -> str:
 
 
 CSV_HEADERS = [
-    "序号", "笔记ID", "标题", "正文摘要", "正文全文", "作者", "作者ID",
-    "发布时间", "话题标签", "点赞", "收藏", "评论", "分享",
-    "IP属地", "图片链接", "视频链接", "封面链接", "视频时长(秒)",
-    "视频摘要", "图片OCR文字", "图片分析摘要", "图片Mermaid图",
-    "笔记链接", "内容类型",
-    "状态", "备注",
+    "序号", "标题", "作者", "发布时间", "类型",
+    "点赞", "收藏", "评论", "分享", "IP属地",
+    "话题", "笔记链接", "媒体", "正文摘要",
 ]
 
 
-def write_csv(conn: sqlite3.Connection, path: Path | None = None) -> Path:
+def write_csv(conn: sqlite3.Connection, path: Path | None = None, user_id: str | None = None) -> list[Path]:
+    """导出 CSV。按博主分文件，放到 output/<博主名>/ 目录。返回生成的文件列表。"""
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    # 统计 DB 内容，生成描述性文件名
-    total_notes = conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
-    video_count = conn.execute("SELECT COUNT(*) FROM notes WHERE type='video'").fetchone()[0]
-    note_count = total_notes - video_count
-    date_str = datetime.now().strftime('%Y%m%d_%H%M%S')
-    desc_parts = []
-    if note_count:
-        desc_parts.append(f"{note_count}图文")
-    if video_count:
-        desc_parts.append(f"{video_count}视频")
-    desc = "+".join(desc_parts) if desc_parts else "export"
-    path = path or (OUTPUT_DIR / f"xhs_{desc}_{date_str}.csv")
-    with open(path, "w", encoding="utf-8-sig", newline="") as f:
-        writer = csv.writer(f, quoting=csv.QUOTE_ALL)
-        writer.writerow(CSV_HEADERS)
-        for i, note in enumerate(iter_notes(conn), 1):
-            user = get_user(conn, note["user_id"]) if note["user_id"] else None
-            raw = json.loads(note["raw_json"] or "{}")
-            topics = json.loads(note["topics"] or "[]")
-            images = _extract_images(raw)
-            # 优先用本地图片路径
-            csv_media_dir = _find_media_dir(note["note_id"], conn)
-            if csv_media_dir.exists():
-                local_imgs = sorted(csv_media_dir.glob("img_*"))
-                if local_imgs:
-                    images = [str(p) for p in local_imgs]
-            # 优先用 DB 列，fallback 到从 raw_json 提取
-            video_url = note["video_url"] or _extract_video_url(raw) or ""
-            cover_url = note["cover_url"] or _extract_cover_url(raw) or ""
-            video_duration = note["video_duration"] or 0
-            video_summary = note["video_summary"] or ""
-            desc = note["description"] or ""
-            image_ocr = note["image_ocr_text"] or ""
-            image_summary = note["image_summary"] or ""
-            image_mermaid = note["image_mermaid"] or ""
-            writer.writerow([
-                i,
-                note["note_id"],
-                note["title"] or "",
-                desc[:200],
-                desc,
-                (user["nickname"] if user else "") if user else "",
-                note["user_id"] or "",
-                note["published_at"] or "",
-                " ".join(f"#{t}" for t in topics),
-                note["liked_count"],
-                note["collected_count"],
-                note["comment_count"],
-                note["share_count"],
-                note["ip_location"] or "",
-                "\n".join(images),
-                video_url,
-                cover_url,
-                video_duration,
-                video_summary,
-                image_ocr,
-                image_summary,
-                image_mermaid,
-                f"https://www.xiaohongshu.com/explore/{note['note_id']}",
-                "视频" if note["type"] == "video" else "图文",
-                "待处理",
-                "",
-            ])
-    return path
+
+    # 按 user_id 分组
+    if user_id:
+        groups = {user_id: list(iter_notes_by_user(conn, user_id))}
+    else:
+        groups: dict[str, list] = {}
+        for note in iter_notes(conn):
+            uid = note["user_id"] or "_unknown"
+            groups.setdefault(uid, []).append(note)
+
+    files = []
+    for uid, notes in groups.items():
+        # 确定博主目录
+        user = get_user(conn, uid) if uid != "_unknown" else None
+        nickname = (user["nickname"] if user else "") or uid
+        safe_author = sanitize_filename(nickname, 30)
+        author_dir = OUTPUT_DIR / safe_author
+        author_dir.mkdir(parents=True, exist_ok=True)
+
+        csv_path = path or (author_dir / f"{safe_author}_笔记列表.csv")
+        with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.writer(f, quoting=csv.QUOTE_ALL)
+            writer.writerow(CSV_HEADERS)
+            for i, note in enumerate(notes, 1):
+                note_user = get_user(conn, note["user_id"]) if note["user_id"] else None
+                topics = json.loads(note["topics"] or "[]")
+                desc = note["description"] or ""
+
+                # 媒体摘要
+                csv_media_dir = _find_media_dir(note["note_id"], conn)
+                media_parts = []
+                if csv_media_dir.exists():
+                    img_count = len(list(csv_media_dir.glob("img_*")))
+                    has_video = any(csv_media_dir.glob("video.*"))
+                    if has_video:
+                        media_parts.append("视频")
+                    if img_count:
+                        media_parts.append(f"{img_count}张图")
+                media_str = "+".join(media_parts) if media_parts else "—"
+
+                # 正文摘要：截断 + 换行替换
+                summary = desc[:200].replace("\n", " ").replace("\r", " ").strip()
+
+                writer.writerow([
+                    i,
+                    note["title"] or "",
+                    (note_user["nickname"] if note_user else "") or "",
+                    note["published_at"] or "",
+                    "视频" if note["type"] == "video" else "图文",
+                    note["liked_count"],
+                    note["collected_count"],
+                    note["comment_count"],
+                    note["share_count"],
+                    note["ip_location"] or "",
+                    " ".join(f"#{t}" for t in topics),
+                    f"https://www.xiaohongshu.com/explore/{note['note_id']}",
+                    media_str,
+                    summary,
+                ])
+        files.append(csv_path)
+        path = None  # 后续分组自动生成路径
+
+    return files
 
 
-def write_json(conn: sqlite3.Connection, path: Path | None = None) -> Path:
-    """导出全部笔记为 JSON 文件。"""
+def iter_notes_by_user(conn: sqlite3.Connection, user_id: str):
+    """按 user_id 迭代笔记。"""
+    cur = conn.execute(
+        "SELECT * FROM notes WHERE user_id = ? ORDER BY published_at DESC",
+        (user_id,),
+    )
+    for row in cur:
+        yield dict(row)
+
+
+def write_json(conn: sqlite3.Connection, path: Path | None = None, user_id: str | None = None) -> Path:
+    """导出笔记为 JSON 文件。user_id 过滤指定博主。"""
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     date_str = datetime.now().strftime('%Y%m%d_%H%M%S')
-    path = path or (OUTPUT_DIR / f"xhs_export_{date_str}.json")
+    if user_id:
+        user = get_user(conn, user_id)
+        nickname = (user["nickname"] if user else "") or user_id
+        safe_author = sanitize_filename(nickname, 30)
+        author_dir = OUTPUT_DIR / safe_author
+        author_dir.mkdir(parents=True, exist_ok=True)
+        path = path or (author_dir / f"{safe_author}_笔记.json")
+    else:
+        path = path or (OUTPUT_DIR / f"xhs_export_{date_str}.json")
     notes = []
-    for note in iter_notes(conn):
+    source = iter_notes_by_user(conn, user_id) if user_id else iter_notes(conn)
+    for note in source:
         d = dict(note)
-        # 解析 JSON 字段
         d["topics"] = json.loads(d.get("topics") or "[]")
         d["raw_json"] = json.loads(d.get("raw_json") or "{}")
         notes.append(d)
@@ -806,16 +897,25 @@ def write_json(conn: sqlite3.Connection, path: Path | None = None) -> Path:
     return path
 
 
-def write_xlsx(conn: sqlite3.Connection, path: Path | None = None) -> Path:
-    """导出全部笔记为 XLSX 文件（多 sheet: notes / users / comments）。需要 openpyxl。"""
+def write_xlsx(conn: sqlite3.Connection, path: Path | None = None, user_id: str | None = None) -> Path:
+    """导出笔记为 XLSX 文件（多 sheet）。user_id 过滤指定博主。需要 openpyxl。"""
     try:
         import openpyxl  # type: ignore
     except ImportError:
         print("[ERR] 导出 xlsx 需要 openpyxl。pip install openpyxl", file=sys.stderr)
         raise
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    date_str = datetime.now().strftime('%Y%m%d_%H%M%S')
-    path = path or (OUTPUT_DIR / f"xhs_export_{date_str}.xlsx")
+    if user_id:
+        user = get_user(conn, user_id)
+        nickname = (user["nickname"] if user else "") or user_id
+        safe_author = sanitize_filename(nickname, 30)
+        author_dir = OUTPUT_DIR / safe_author
+        author_dir.mkdir(parents=True, exist_ok=True)
+        date_str = datetime.now().strftime('%Y%m%d_%H%M%S')
+        path = path or (author_dir / f"{safe_author}_笔记.xlsx")
+    else:
+        date_str = datetime.now().strftime('%Y%m%d_%H%M%S')
+        path = path or (OUTPUT_DIR / f"xhs_export_{date_str}.xlsx")
     wb = openpyxl.Workbook()
 
     # Sheet 1: Notes
@@ -830,7 +930,7 @@ def write_xlsx(conn: sqlite3.Connection, path: Path | None = None) -> Path:
         "crawled_at",
     ]
     ws_notes.append(note_cols)
-    for note in iter_notes(conn):
+    for note in (iter_notes_by_user(conn, user_id) if user_id else iter_notes(conn)):
         ws_notes.append([note.get(c, "") for c in note_cols])
 
     # Sheet 2: Users
@@ -910,14 +1010,18 @@ def _find_media_dir(note_id: str, conn: sqlite3.Connection) -> Path:
 
     新结构: media/<博主名>/<笔记标题>/
     旧结构: media/<note_id>/
+
+    当新旧目录都存在时，优先返回有实际内容的那个；
+    如果都有内容，优先新路径（后续下载会写入新路径）。
     """
-    # 先尝试新路径
     new_dir = note_media_dir(note_id, conn)
-    if new_dir.exists() and any(new_dir.iterdir()):
-        return new_dir
-    # 旧路径兼容
+    new_has_content = new_dir.exists() and any(new_dir.iterdir())
     legacy_dir = MEDIA_DIR / note_id
-    if legacy_dir.exists():
+    legacy_has_content = legacy_dir.exists() and any(legacy_dir.iterdir())
+
+    if new_has_content:
+        return new_dir
+    if legacy_has_content:
         return legacy_dir
-    # 都不存在，返回新路径（作为目标目录）
+    # 都不存在或都为空，返回新路径（作为目标目录）
     return new_dir

@@ -163,35 +163,13 @@ def find_video_local(note_id: str, conn: sqlite3.Connection) -> Path | None:
 
 
 def _refresh_video_url(note_id: str, conn: sqlite3.Connection) -> None:
-    """当 video_url 为空时，抓笔记详情补全 video_url/type 等字段。
+    """当 video_url 为空时，提示用户需要先抓笔记详情。
 
-    user_posted / search 等列表 API 返回的是摘要数据，不含完整 video URL。
-    通过 feed API 获取完整数据并更新 DB。
+    列表 API（user_posted / search）返回摘要数据，不含完整 video URL。
+    需要通过 `note <id>` 命令获取完整数据才能下载视频。
     """
-    try:
-        import xhs_api
-        import xhs_storage
-        row = xhs_storage.get_note(conn, note_id)
-        if not row:
-            return
-        xsec_token = row["xsec_token"] or ""
-        xsec_source = row["xsec_source"] or "pc_search"
-        # 需要一个 fetcher 实例 — 用全局或延迟导入
-        from xhs_fetcher import Fetcher
-        from xhs_config import COOKIES_PATH
-        import xhs_accounts
-        fetcher = xhs_accounts.get_fetcher()
-        if not fetcher:
-            return
-        item = xhs_api.fetch_note_detail(fetcher, note_id, xsec_token, xsec_source)
-        note = xhs_api._normalize_note(item)
-        note["user_id"] = row["user_id"]
-        xhs_storage.upsert_note(conn, note)
-        conn.commit()
-        if note.get("video_url"):
-            print(f"    [refresh] 已补全 video_url", file=sys.stderr)
-    except Exception as e:
-        print(f"    [refresh] 补全 video_url 失败: {e}", file=sys.stderr)
+    print(f"    [refresh] 笔记 {note_id} 缺少 video_url，请先运行: "
+          f"python scripts/xhs.py note {note_id}", file=sys.stderr)
 
 
 def post_process_note(note: dict, conn: sqlite3.Connection, args) -> None:
