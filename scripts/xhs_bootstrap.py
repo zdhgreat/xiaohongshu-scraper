@@ -303,7 +303,7 @@ def ensure_ready(force: bool = False) -> None:
 def _check_ffmpeg() -> None:
     """检查 ffmpeg 是否可用，不可用时给出安装提示（不自动安装）。"""
     try:
-        r = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True, timeout=5)
+        r = subprocess.run(["ffmpeg", "-version"], capture_output=True, encoding="utf-8", errors="replace", timeout=5)
         if r.returncode == 0:
             return
     except (FileNotFoundError, subprocess.TimeoutExpired):
@@ -400,7 +400,7 @@ def cmd_setup(args) -> int:
 
     # ffmpeg
     try:
-        r = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True, timeout=5)
+        r = subprocess.run(["ffmpeg", "-version"], capture_output=True, encoding="utf-8", errors="replace", timeout=5)
         if r.returncode == 0:
             print(f"  OK  {'ffmpeg':30s} 视频音频处理", file=sys.stderr)
         else:

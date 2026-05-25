@@ -77,7 +77,7 @@ def save_config(cfg: dict[str, Any]) -> None:
 
 def has_ffmpeg() -> bool:
     try:
-        r = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True, timeout=5)
+        r = subprocess.run(["ffmpeg", "-version"], capture_output=True, encoding="utf-8", errors="replace", timeout=5)
         return r.returncode == 0
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return False
@@ -150,7 +150,7 @@ def extract_audio(
         "-ac", "1",              # 单声道
         str(output_path),
     ]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    r = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace", timeout=30)
     if r.returncode != 0:
         raise RuntimeError(f"ffmpeg 音频提取失败: {r.stderr[:200]}")
     return output_path
@@ -235,7 +235,7 @@ def extract_keyframes(video_path: Path, output_dir: Path, interval: int = 5) -> 
         pattern,
     ]
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        r = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace", timeout=30)
     except subprocess.TimeoutExpired as proc:
         proc.kill()
         _msg("关键帧提取超时，使用已提取的帧")

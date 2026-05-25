@@ -87,8 +87,10 @@ def download_media(
                 raise
             n_ok += 1
             time.sleep(random.uniform(0.3, 1.0))
-        except Exception:
+        except Exception as e:
             n_err += 1
+            if n_err <= 3:
+                print(f"  [download] 图片下载失败 {url[:60]}...: {e}", file=sys.stderr)
 
     # 2) 视频（流式）
     n_video = 0
@@ -121,12 +123,11 @@ def download_media(
                     except Exception:
                         tmp.unlink(missing_ok=True)
                         raise
-                except Exception:
+                except Exception as e:
                     n_err += 1
+                    print(f"  [download] 视频下载失败: {e}", file=sys.stderr)
 
     return n_ok, n_video, n_err, out
-
-
 def auto_download_note(note: dict, conn: sqlite3.Connection) -> None:
     """抓取笔记后自动下载图片（轻量，仅图片，不打扰用户）。
 

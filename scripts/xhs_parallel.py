@@ -31,6 +31,10 @@ class TaskResult:
     status: str = "pending"       # ok / error / skipped
     total: int = 0
     error: str = ""
+    comment_count: int = 0
+    detail_errors: int = 0
+    comment_errors: int = 0
+    media_errors: int = 0
 
 
 def _make_fetcher_for_account(alias: str, speed_mode: str = "paranoid",
@@ -50,6 +54,7 @@ def _make_fetcher_for_account(alias: str, speed_mode: str = "paranoid",
         force_account=alias,
         sign_mode_label=sign_mode,
         speed_mode_label=speed_mode,
+        autonomous=True,
     )
 
 
@@ -114,6 +119,7 @@ def _crawl_user_worker(alias: str, user_id: str, max_pages: int,
     hb = Heartbeat()
     fetcher = _make_fetcher_for_account(alias, speed_mode, sign_mode)
     conn = xhs_storage.connect()
+    detail_err = comment_err = media_err = 0
 
     try:
         fetcher.warmup()
@@ -166,13 +172,18 @@ def _crawl_user_worker(alias: str, user_id: str, max_pages: int,
             if not row:
                 continue
             note_dict = dict(row)
-            _enrich_note(fetcher, note_dict, conn)
+            try:
+                _enrich_note(fetcher, note_dict, conn)
+            except Exception as e:
+                detail_err += 1
+                if detail_err <= 3:
+                    print(f"{tag} 详情失败 {nid[:12]}...: {e}", file=sys.stderr)
             enriched += 1
             if enriched % 20 == 0:
                 conn.commit()
                 print(f"{tag} 详情进度: {enriched}/{len(note_ids)}", file=sys.stderr)
         conn.commit()
-        print(f"{tag} 详情完成: {enriched}/{len(note_ids)}", file=sys.stderr)
+        print(f"{tag} 详情完成: {enriched}/{len(note_ids)} ({detail_err} 失败)", file=sys.stderr)
 
         # 第三轮：抓评论
         print(f"{tag} 开始抓取 {len(note_ids)} 条笔记评论...", file=sys.stderr)
@@ -187,11 +198,13 @@ def _crawl_user_worker(alias: str, user_id: str, max_pages: int,
             try:
                 cnt = _fetch_comments_for_note(fetcher, conn, nid, token, max_pages=3)
                 comment_total += cnt
-            except Exception:
-                pass
+            except Exception as e:
+                comment_err += 1
+                if comment_err <= 3:
+                    print(f"{tag} 评论失败 {nid[:12]}...: {e}", file=sys.stderr)
             if (i + 1) % 20 == 0:
                 print(f"{tag} 评论进度: {i+1}/{len(note_ids)} 累计 {comment_total} 条", file=sys.stderr)
-        print(f"{tag} 评论完成: {comment_total} 条", file=sys.stderr)
+        print(f"{tag} 评论完成: {comment_total} 条 ({comment_err} 失败)", file=sys.stderr)
 
         # 第四轮：下载+分析
         if download or analyze:
@@ -205,11 +218,18 @@ def _crawl_user_worker(alias: str, user_id: str, max_pages: int,
                     xhs_media.post_process_note(note_dict, conn, type('Args', (), {
                         'download': download, 'analyze': analyze,
                     })())
-                except Exception:
-                    pass
+                except Exception as e:
+                    media_err += 1
+                    if media_err <= 3:
+                        print(f"{tag} 后处理失败 {nid[:12]}...: {e}", file=sys.stderr)
 
-        results[alias] = TaskResult(alias, f"user:{user_id}", "ok", total)
-        print(f"{tag} 完成: {total} 条笔记, {comment_total} 条评论", file=sys.stderr)
+        results[alias] = TaskResult(alias, f"user:{user_id}", "ok", total,
+                                    comment_count=comment_total,
+                                    detail_errors=detail_err,
+                                    comment_errors=comment_err,
+                                    media_errors=media_err)
+        print(f"{tag} 完成: {total} 条笔记, {comment_total} 条评论"
+              f" (详情×{detail_err} 评论×{comment_err} 媒体×{media_err})", file=sys.stderr)
 
     except Exception as e:
         results[alias] = TaskResult(alias, f"user:{user_id}", "error", 0, str(e))
@@ -235,6 +255,7 @@ def _crawl_search_worker(alias: str, keyword: str, max_pages: int,
     hb = Heartbeat()
     fetcher = _make_fetcher_for_account(alias, speed_mode, sign_mode)
     conn = xhs_storage.connect()
+    detail_err = comment_err = media_err = 0
 
     try:
         fetcher.warmup()
@@ -272,13 +293,18 @@ def _crawl_search_worker(alias: str, keyword: str, max_pages: int,
             if not row:
                 continue
             note_dict = dict(row)
-            _enrich_note(fetcher, note_dict, conn)
+            try:
+                _enrich_note(fetcher, note_dict, conn)
+            except Exception as e:
+                detail_err += 1
+                if detail_err <= 3:
+                    print(f"{tag} 详情失败 {nid[:12]}...: {e}", file=sys.stderr)
             enriched += 1
             if enriched % 20 == 0:
                 conn.commit()
                 print(f"{tag} 详情进度: {enriched}/{len(all_note_ids)}", file=sys.stderr)
         conn.commit()
-        print(f"{tag} 详情完成: {enriched}/{len(all_note_ids)}", file=sys.stderr)
+        print(f"{tag} 详情完成: {enriched}/{len(all_note_ids)} ({detail_err} 失败)", file=sys.stderr)
 
         # 第三轮：抓评论
         print(f"{tag} 开始抓取 {len(all_note_ids)} 条笔记评论...", file=sys.stderr)
@@ -293,11 +319,13 @@ def _crawl_search_worker(alias: str, keyword: str, max_pages: int,
             try:
                 cnt = _fetch_comments_for_note(fetcher, conn, nid, token, max_pages=3)
                 comment_total += cnt
-            except Exception:
-                pass
+            except Exception as e:
+                comment_err += 1
+                if comment_err <= 3:
+                    print(f"{tag} 评论失败 {nid[:12]}...: {e}", file=sys.stderr)
             if (i + 1) % 20 == 0:
                 print(f"{tag} 评论进度: {i+1}/{len(all_note_ids)} 累计 {comment_total} 条", file=sys.stderr)
-        print(f"{tag} 评论完成: {comment_total} 条", file=sys.stderr)
+        print(f"{tag} 评论完成: {comment_total} 条 ({comment_err} 失败)", file=sys.stderr)
 
         # 第四轮：下载+分析
         if download or analyze:
@@ -311,11 +339,18 @@ def _crawl_search_worker(alias: str, keyword: str, max_pages: int,
                     xhs_media.post_process_note(note_dict, conn, type('Args', (), {
                         'download': download, 'analyze': analyze,
                     })())
-                except Exception:
-                    pass
+                except Exception as e:
+                    media_err += 1
+                    if media_err <= 3:
+                        print(f"{tag} 后处理失败 {nid[:12]}...: {e}", file=sys.stderr)
 
-        results[alias] = TaskResult(alias, f"search:{keyword}", "ok", total)
-        print(f"{tag} 完成: {total} 条笔记, {comment_total} 条评论", file=sys.stderr)
+        results[alias] = TaskResult(alias, f"search:{keyword}", "ok", total,
+                                    comment_count=comment_total,
+                                    detail_errors=detail_err,
+                                    comment_errors=comment_err,
+                                    media_errors=media_err)
+        print(f"{tag} 完成: {total} 条笔记, {comment_total} 条评论"
+              f" (详情×{detail_err} 评论×{comment_err} 媒体×{media_err})", file=sys.stderr)
 
     except Exception as e:
         results[alias] = TaskResult(alias, f"search:{keyword}", "error", 0, str(e))
@@ -400,8 +435,14 @@ def run_parallel(task_type: str, tasks: list[str], max_pages: int,
 
     for t in threads:
         t.start()
+    # 超时保护：每个任务最多 4 小时（slow 模式 100 条笔记约需 3 小时）
+    timeout = max_pages * 180 * 60  # 每页最多 3 小时
+    timeout = max(timeout, 3600)    # 下限 1 小时
     for t in threads:
-        t.join()
+        t.join(timeout=timeout)
+        if t.is_alive():
+            print(f"[PARALLEL] 警告: 线程 {t.name} 超时未完成（{timeout}s），继续等待...",
+                  file=sys.stderr)
 
     # 汇总结果
     print("\n" + "=" * 50, file=sys.stderr)
@@ -410,7 +451,10 @@ def run_parallel(task_type: str, tasks: list[str], max_pages: int,
     total_notes = 0
     for key, r in results.items():
         icon = "OK" if r.status == "ok" else "ERR"
-        print(f"  [{icon}] {r.alias:15s} {r.task:30s} → {r.total} 条"
+        errs = ""
+        if r.status == "ok" and (r.detail_errors or r.comment_errors or r.media_errors):
+            errs = f" [详情×{r.detail_errors} 评论×{r.comment_errors} 媒体×{r.media_errors}]"
+        print(f"  [{icon}] {r.alias:15s} {r.task:30s} → {r.total} 条{errs}"
               + (f" ({r.error})" if r.error else ""),
               file=sys.stderr)
         if r.status == "ok":

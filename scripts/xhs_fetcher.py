@@ -52,6 +52,7 @@ class Fetcher:
         force_account: str | None = None,
         sign_mode_label: str = "auto",
         speed_mode_label: str = "normal",
+        autonomous: bool = False,
     ) -> None:
         self.signer = signer
         self.speed = speed
@@ -97,6 +98,7 @@ class Fetcher:
         self.browser_takeover: PlaywrightTakeover | None = None
         self._warmed = False
         self._relogin_count = 0
+        self.autonomous = autonomous
         self._engine_label = "curl_cffi/" + xhs_config.IMPERSONATE_PROFILE if _CURL_CFFI else "requests/native"
         proxy_info = f"proxy={self.current_proxy.label}" if self.current_proxy else "直连"
         print(f"[FETCH] HTTP engine: {self._engine_label} | account={self.account.alias} | {proxy_info}",
@@ -410,9 +412,17 @@ class Fetcher:
                         raise FatalRiskError("cookie 重登后仍失效，请手动登录")
                     self._relogin_count += 1
                     print(f"[FETCH] cookie 失效，尝试重登...", file=sys.stderr)
-                    import xhs_login
-                    # 多账号时优先 QR 扫码（profile_hint 隔离），避免 rookiepy 取到其他账号的 cookie
-                    new_cookies = xhs_login.acquire_cookies(prefer="auto", profile_hint=self.account.alias)
+                    if self.autonomous:
+                        # 自主模式：只尝试 rookiepy（无需人工），跳过 QR/手动
+                        try:
+                            import xhs_login
+                            new_cookies = xhs_login.acquire_cookies(prefer="rookie", profile_hint=self.account.alias)
+                        except Exception as e:
+                            raise FatalRiskError(f"cookie 失效且自动刷新失败: {e}")
+                    else:
+                        import xhs_login
+                        # 多账号时优先 QR 扫码（profile_hint 隔离），避免 rookiepy 取到其他账号的 cookie
+                        new_cookies = xhs_login.acquire_cookies(prefer="auto", profile_hint=self.account.alias)
                     self.cookies = new_cookies
                     self.account.cookies = new_cookies
                     self.account.save_cookies()
@@ -458,7 +468,12 @@ class Fetcher:
             # 先尝试切账号
             if self._rotate_account("461 验证码"):
                 return self._call_raw(method, api, params, data, count=False, _retry_depth=_retry_depth + 1)
-            # 否则切浏览器接管
+            # 否则切浏览器接管（仅交互模式）
+            if self.autonomous:
+                raise FatalRiskError(
+                    f"账号 {self.account.alias} 触发 461 验证码且无可用备选账号，"
+                    "自主模式下跳过浏览器接管，请检查账号状态"
+                )
             return self._browser_fetch(method, api, params, data)
 
         if status == 429:
