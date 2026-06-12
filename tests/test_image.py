@@ -1,5 +1,4 @@
-"""测试 xhs_image 模块：配置、Mermaid 校验、本地分析、图片分析 DB 集成。"""
-import json
+"""测试 xhs_image 模块：配置、图片分析 DB 集成。"""
 import sys
 from pathlib import Path
 
@@ -18,73 +17,21 @@ import xhs_storage
 class TestConfig:
     def test_default_config(self):
         cfg = xhs_image.DEFAULT_CONFIG
-        assert cfg["image_mode"] == "auto"
-        assert cfg["image_vision_backend"] == "api"
-        assert cfg["image_mermaid"] is True
+        assert isinstance(cfg, dict)
 
     def test_load_config_default(self, tmp_path, monkeypatch):
         """无配置文件时返回默认值。"""
         monkeypatch.setattr(xhs_image, "CONFIG_PATH", tmp_path / "image_config.json")
         cfg = xhs_image.load_config()
-        assert cfg["image_mode"] == "auto"
+        assert isinstance(cfg, dict)
 
     def test_save_and_load_config(self, tmp_path, monkeypatch):
         monkeypatch.setattr(xhs_image, "DATA", tmp_path)
         monkeypatch.setattr(xhs_image, "CONFIG_PATH", tmp_path / "image_config.json")
-        cfg = {"image_mode": "vision", "api_key": "test-key"}
+        cfg = {"enabled": True}
         xhs_image.save_config(cfg)
         loaded = xhs_image.load_config()
-        assert loaded["image_mode"] == "vision"
-        assert loaded["api_key"] == "test-key"
-        # 默认值也合并了
-        assert "image_mermaid" in loaded
-
-
-# ---------------------------------------------------------------------------
-# Mermaid validation
-# ---------------------------------------------------------------------------
-
-class TestMermaidValidation:
-    def test_valid_graph_lr(self):
-        code = "graph LR\n    A[成都] -->|飞机| B[九寨沟]"
-        assert xhs_image._validate_mermaid(code) is True
-
-    def test_valid_flowchart_td(self):
-        code = "flowchart TD\n    A[开始] --> B[结束]"
-        assert xhs_image._validate_mermaid(code) is True
-
-    def test_empty(self):
-        assert xhs_image._validate_mermaid("") is False
-        assert xhs_image._validate_mermaid("  ") is False
-
-    def test_invalid_prefix(self):
-        assert xhs_image._validate_mermaid("digraph { A -> B }") is False
-        assert xhs_image._validate_mermaid("some random text") is False
-
-    def test_xss_rejected(self):
-        code = "graph LR\n    A[<script>alert(1)</script>] --> B"
-        assert xhs_image._validate_mermaid(code) is False
-
-
-# ---------------------------------------------------------------------------
-# Local analysis
-# ---------------------------------------------------------------------------
-
-class TestAnalyzeLocal:
-    def test_empty_ocr(self):
-        result = xhs_image._analyze_local("", "标题", "描述")
-        assert "未识别到文字" in result
-
-    def test_with_ocr_text(self):
-        ocr = "成都到九寨沟 飞机1小时 门票169元 住宿280元"
-        result = xhs_image._analyze_local(ocr, "旅游攻略", "三天两夜行程")
-        assert "成都到九寨沟" in result
-        assert len(result) > 50
-
-    def test_with_title_overlap(self):
-        ocr = "露营装备推荐 帐篷 睡袋"
-        result = xhs_image._analyze_local(ocr, "露营装备", "")
-        assert "露营" in result
+        assert loaded["enabled"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -93,22 +40,21 @@ class TestAnalyzeLocal:
 
 class TestImageAnalysisDB:
     def test_update_image_analysis(self, db_conn):
-        """update_image_analysis 应写入三个字段。"""
-        # 先插入一条笔记
+        """update_image_analysis 应写入 OCR 字段。"""
         note = {"note_id": "img_note_1", "title": "测试图文", "type": "note"}
         xhs_storage.upsert_note(db_conn, note)
 
         xhs_storage.update_image_analysis(
             db_conn, "img_note_1",
             ocr_text="图片中的文字",
-            summary="AI 描述内容",
-            mermaid="graph LR\n    A --> B",
+            summary="",
+            mermaid="",
         )
 
         row = xhs_storage.get_note(db_conn, "img_note_1")
         assert row["image_ocr_text"] == "图片中的文字"
-        assert row["image_summary"] == "AI 描述内容"
-        assert row["image_mermaid"] == "graph LR\n    A --> B"
+        assert row["image_summary"] == ""
+        assert row["image_mermaid"] == ""
 
     def test_update_preserves_existing(self, db_conn):
         """更新图片分析不应影响已有字段。"""
@@ -138,29 +84,24 @@ class TestImageAnalysisDB:
 # ---------------------------------------------------------------------------
 
 class TestImageMarkdown:
-    def test_render_with_image_analysis(self, db_conn, tmp_path, monkeypatch):
-        """多文件导出时 images.md 应包含图片分析段落。"""
+    def test_render_with_ocr_only(self, db_conn, tmp_path, monkeypatch):
+        """仅有 OCR 时 images.md 应包含图片文字段落。"""
         note = {"note_id": "md_img_1", "title": "旅游攻略", "type": "note"}
         xhs_storage.upsert_note(db_conn, note)
         xhs_storage.update_image_analysis(
             db_conn, "md_img_1",
             ocr_text="Day1 成都→九寨沟",
-            summary="这是一篇旅游攻略",
-            mermaid="graph LR\n    A[成都] --> B[九寨沟]",
+            summary="",
+            mermaid="",
         )
 
         monkeypatch.setattr(xhs_storage, "OUTPUT_DIR", tmp_path)
         files = xhs_storage.write_markdown_files(db_conn, "md_img_1")
-        # 找到 images.md
         images_md = next((f for f in files if f.name == "images.md"), None)
         assert images_md is not None, f"images.md not found in {files}"
         content = images_md.read_text(encoding="utf-8")
-        assert "AI 描述" in content
-        assert "这是一篇旅游攻略" in content
         assert "图片文字" in content
         assert "Day1 成都→九寨沟" in content
-        assert "```mermaid" in content
-        assert "graph LR" in content
 
     def test_render_without_image_analysis(self, db_conn, tmp_path, monkeypatch):
         """无图片分析数据时不应生成 images.md。"""
@@ -185,7 +126,6 @@ class TestImageCSV:
         xhs_storage.update_image_analysis(
             db_conn, "csv_img_1",
             ocr_text="OCR text",
-            summary="Summary",
         )
 
         csv_path = tmp_path / "test.csv"

@@ -33,6 +33,27 @@ class WslLoginError(RuntimeError):
     pass
 
 
+def _build_sqlite_cookie_meta(
+    host: str, path: str, secure: bool | int,
+    httponly: bool | int, samesite: int | str | None,
+    expiry: int | float | None,
+) -> dict:
+    """从 SQLite 行字段构建 cookie 元数据字典。"""
+    meta: dict = {"domain": host, "path": path}
+    if int(secure):
+        meta["secure"] = True
+    if int(httponly):
+        meta["httpOnly"] = True
+    if samesite is not None:
+        if isinstance(samesite, int):
+            meta["sameSite"] = {0: "None", 1: "Lax", 2: "Strict"}.get(samesite, "Lax")
+        elif samesite:
+            meta["sameSite"] = str(samesite)
+    if expiry and float(expiry) > 0:
+        meta["expires"] = float(expiry)
+    return meta
+
+
 def is_wsl() -> bool:
     try:
         with open("/proc/version", encoding="utf-8") as f:
@@ -244,19 +265,24 @@ def _looks_like_text(b: bytes) -> bool:
         return False
 
 
-def _extract_xhs_cookies(db_path: Path, aes_key: bytes) -> dict[str, str]:
+def _extract_xhs_cookies(db_path: Path, aes_key: bytes) -> tuple[dict[str, str], dict[str, dict]]:
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
         cur = conn.execute(
-            "SELECT name, encrypted_value FROM cookies "
+            "SELECT name, encrypted_value, host_key, path, is_secure, is_httponly, samesite, expires_utc "
+            "FROM cookies "
             "WHERE host_key LIKE '%xiaohongshu.com%' OR host_key LIKE '%xhscdn.com%'"
         )
         cookies: dict[str, str] = {}
+        cookie_meta: dict[str, dict] = {}
         v20_count = 0
         skipped_other = 0
-        for name, enc in cur.fetchall():
+        for name, enc, host_key, path, is_secure, is_httponly, samesite, expires_utc in cur.fetchall():
             try:
                 cookies[name] = _decrypt_cookie_value(bytes(enc), aes_key)
+                cookie_meta[name] = _build_sqlite_cookie_meta(
+                    host_key, path, is_secure, is_httponly, samesite,
+                    expires_utc / 1e6 - 11644473600 if expires_utc else 0)
             except WslLoginError as e:
                 if str(e) == "v20":
                     v20_count += 1
@@ -274,13 +300,13 @@ def _extract_xhs_cookies(db_path: Path, aes_key: bytes) -> dict[str, str]:
                 "（从 DevTools Network 面板复制 Cookie 请求头粘贴）\n"
                 "    3) 备选 → 装 Firefox 登录小红书，再 `--prefer wsl-firefox`（待实现）"
             )
-        return cookies
+        return cookies, cookie_meta
     finally:
         conn.close()
 
 
-def acquire_from_wsl_browser(browser: str = "edge", auto_close: bool = True) -> dict[str, str]:
-    """主入口。browser ∈ {edge, chrome}。auto_close=True 自动关浏览器拿锁。"""
+def acquire_from_wsl_browser(browser: str = "edge", auto_close: bool = True) -> tuple[dict[str, str], dict[str, dict]]:
+    """主入口。browser ∈ {edge, chrome}。auto_close=True 自动关浏览器拿锁。返回 (cookies, cookie_meta)。"""
     if not is_wsl():
         raise WslLoginError("not running on WSL")
 
@@ -298,7 +324,7 @@ def acquire_from_wsl_browser(browser: str = "edge", auto_close: bool = True) -> 
     with tempfile.TemporaryDirectory(prefix="xhs_wsl_") as tmp:
         db_dst = Path(tmp) / "Cookies"
         _copy_locked_db(db_src, db_dst, browser=browser, auto_close=auto_close)
-        cookies = _extract_xhs_cookies(db_dst, aes_key)
+        cookies, cookie_meta = _extract_xhs_cookies(db_dst, aes_key)
 
     if not cookies:
         raise WslLoginError(f"{browser} 中没有 xiaohongshu.com 的 cookie，请先在 {browser} 登录小红书")
@@ -309,7 +335,7 @@ def acquire_from_wsl_browser(browser: str = "edge", auto_close: bool = True) -> 
     if missing:
         raise WslLoginError(f"提取成功但缺关键字段：{missing}（可能是登录态过期）")
 
-    return cookies
+    return cookies, cookie_meta
 
 
 # ---------------------------------------------------------------------------
@@ -351,10 +377,11 @@ def acquire_from_wsl_browser_cdp(
     browser: str = "edge",
     port: int = 9222,
     nav_timeout_s: int = 30,
-) -> dict[str, str]:
+) -> tuple[dict[str, str], dict[str, dict]]:
     """用 CDP 让浏览器自己解密 v20 cookies。需要：
     - 浏览器已安装且 user data dir 里有 xhs 登录态
     - playwright 已装（仅用 Playwright 的 connect_over_cdp，不启 Chromium）
+    返回 (cookies, cookie_meta)。
     """
     if not is_wsl():
         raise WslLoginError("not running on WSL")
@@ -376,53 +403,59 @@ def acquire_from_wsl_browser_cdp(
 
     print(f"[LOGIN-CDP] 启动 {browser} headless + CDP 端口 {port}...", file=sys.stderr)
     log_file = Path("/tmp") / f"xhs_{browser}_cdp.log"
-    log_fh = open(log_file, "wb")
-    proc = subprocess.Popen(
-        [str(exe),
-         "--headless=new", "--disable-gpu",
-         f"--remote-debugging-port={port}",
-         f"--user-data-dir={profile_win}",
-         "--no-first-run", "--no-default-browser-check",
-         "about:blank"],
-        stdout=log_fh, stderr=subprocess.STDOUT,
-    )
-    try:
-        # 等 CDP 端口就绪
-        import urllib.request, urllib.error
-        deadline = time.time() + 15
-        while time.time() < deadline:
-            try:
-                urllib.request.urlopen(f"http://localhost:{port}/json/version", timeout=2).read()
-                break
-            except urllib.error.URLError:
-                time.sleep(0.5)
-        else:
-            raise WslLoginError(f"CDP 端口 {port} 未就绪")
+    proc = None
+    with open(log_file, "wb") as log_fh:
+        proc = subprocess.Popen(
+            [str(exe),
+             "--headless=new", "--disable-gpu",
+             f"--remote-debugging-port={port}",
+             f"--user-data-dir={profile_win}",
+             "--no-first-run", "--no-default-browser-check",
+             "about:blank"],
+            stdout=log_fh, stderr=subprocess.STDOUT,
+        )
+        try:
+            # 等 CDP 端口就绪
+            import urllib.request, urllib.error
+            deadline = time.time() + 15
+            while time.time() < deadline:
+                try:
+                    urllib.request.urlopen(f"http://localhost:{port}/json/version", timeout=2).read()
+                    break
+                except urllib.error.URLError:
+                    time.sleep(0.5)
+            else:
+                raise WslLoginError(f"CDP 端口 {port} 未就绪")
 
-        with sync_playwright() as pw:
-            cdp = pw.chromium.connect_over_cdp(f"http://localhost:{port}")
-            ctx = cdp.contexts[0]
-            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+            with sync_playwright() as pw:
+                cdp = pw.chromium.connect_over_cdp(f"http://localhost:{port}")
+                ctx = cdp.contexts[0]
+                page = ctx.pages[0] if ctx.pages else ctx.new_page()
+                try:
+                    page.goto("https://www.xiaohongshu.com/explore",
+                              wait_until="domcontentloaded", timeout=nav_timeout_s * 1000)
+                except Exception as e:
+                    print(f"[LOGIN-CDP] navigate 警告：{e}", file=sys.stderr)
+                cks = ctx.cookies(["https://www.xiaohongshu.com", "https://edith.xiaohongshu.com"])
+                cookies: dict[str, str] = {}
+                cookie_meta: dict[str, dict] = {}
+                for c in cks:
+                    if "xiaohongshu" not in c.get("domain", ""):
+                        continue
+                    name = c["name"]
+                    cookies[name] = c["value"]
+                    meta = {k: c[k] for k in ("domain", "path", "secure", "httpOnly", "sameSite", "expires")
+                            if k in c and c[k] is not None}
+                    if meta:
+                        cookie_meta[name] = meta
+                cdp.close()
+        finally:
             try:
-                page.goto("https://www.xiaohongshu.com/explore",
-                          wait_until="domcontentloaded", timeout=nav_timeout_s * 1000)
-            except Exception as e:
-                print(f"[LOGIN-CDP] navigate 警告：{e}", file=sys.stderr)
-            cks = ctx.cookies(["https://www.xiaohongshu.com", "https://edith.xiaohongshu.com"])
-            cookies = {c["name"]: c["value"] for c in cks
-                       if "xiaohongshu" in c.get("domain", "")}
-            cdp.close()
-    finally:
-        try:
-            proc.terminate()
-            proc.wait(timeout=5)
-        except Exception:
-            proc.kill()
-        try:
-            log_fh.close()
-        except Exception:
-            pass
-        _stop_browser(browser)
+                proc.terminate()
+                proc.wait(timeout=5)
+            except Exception:
+                proc.kill()
+            _stop_browser(browser)
 
     if not cookies:
         raise WslLoginError(f"{browser} 中没有 xiaohongshu cookie")
@@ -435,7 +468,7 @@ def acquire_from_wsl_browser_cdp(
         )
     print(f"[LOGIN-CDP] 提取到 {len(cookies)} 个 cookies：{', '.join(list(cookies.keys())[:8])}",
           file=sys.stderr)
-    return cookies
+    return cookies, cookie_meta
 
 
 if __name__ == "__main__":

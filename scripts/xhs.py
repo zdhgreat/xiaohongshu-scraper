@@ -12,11 +12,14 @@
 
 from __future__ import annotations
 
+__version__ = "3.0.0"
+
 import argparse
 import io
 import json
+import os
+import random
 import sys
-import threading
 import time
 import traceback
 from pathlib import Path
@@ -45,7 +48,7 @@ from xhs_api import (
 # 从子模块导入 CLI 命令处理器
 from xhs_analyze import cmd_analyze
 from xhs_bootstrap import cmd_setup, cmd_setup_wizard
-from xhs_image import cmd_analyze_images, cmd_setup_image
+from xhs_image import cmd_analyze_images
 from xhs_video import cmd_analyze_video, cmd_setup_video
 
 
@@ -69,6 +72,9 @@ def _try_upsert_user_from_note(note: dict, conn) -> None:
     if not isinstance(raw, dict):
         return
     user_info = raw.get("user") or {}
+    # 搜索/推荐流 API 返回格式中用户数据嵌套在 note_card.user 下
+    if not user_info:
+        user_info = (raw.get("note_card") or {}).get("user") or {}
     if not user_info:
         return
     user_info["user_id"] = user_id
@@ -105,6 +111,54 @@ def _desc_preview(note: dict, max_len: int = 50) -> str:
     return title
 
 
+def _try_pg_sync() -> None:
+    """命令成功后自动尝试同步 SQLite → PG（POSTGRES_DB 配置的库）。
+
+    静默失败：PG 不可用、hub_adapter 未安装等情况不影响主流程。
+    """
+    # 只对会写入数据的命令做同步（login/health/stats 等跳过）
+    try:
+        adapter_path = Path(__file__).resolve().parent.parent / "hub_adapter.py"
+        if not adapter_path.exists():
+            return
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("hub_adapter", str(adapter_path))
+        if not spec or not spec.loader:
+            return
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        pg_conn = mod.get_pg_connection()
+        try:
+            # 先建表/迁移列：链路 B（xhs.py 自动同步）不经 hub_adapter.main()，
+            # 若 PG 库是旧 schema（缺 status/media_path 列），upsert 会静默失败
+            mod.init_schema(pg_conn)
+            count = mod.sync_sqlite_to_pg(pg_conn)
+            if count:
+                print(f"[PG-SYNC] 已自动同步到 PG ({os.getenv('POSTGRES_DB', 'financial_hub')})")
+        finally:
+            pg_conn.close()
+    except ImportError:
+        pass  # psycopg2 / financial_hub_postgres 未安装
+    except Exception:
+        pass  # PG 不可用，不影响主流程
+
+
+def _print_correction_hint() -> None:
+    """数据写入后检测待纠错视频转录，打印醒目提示，引导执行 correct。"""
+    try:
+        conn = xhs_storage.connect()
+        rows = xhs_storage.list_pending_corrections(conn, limit=9999)
+        conn.close()
+    except Exception:
+        return
+    if rows:
+        print(f"\n⚠️ [CORRECT] 检测到 {len(rows)} 条视频转录待纠错"
+              f"（Whisper 原始输出含同音字/英文错误，不可直接使用）。")
+        print(f"   列出：python scripts/xhs.py correct --list")
+        print(f"   写回：python scripts/xhs.py correct --note <id> --apply \"<纠错后转录>\"")
+
+
 # ---------------------------------------------------------------------------
 # Fetcher 工厂
 # ---------------------------------------------------------------------------
@@ -121,6 +175,9 @@ def _validate_accounts(mgr: xhs_accounts.AccountManager) -> None:
         except Exception:
             print(f"  [{alias:15s}] 网络异常（不跳过）", file=sys.stderr)
             continue
+        if valid is None:
+            print(f"  [{alias:15s}] 网络异常（不跳过）", file=sys.stderr)
+            continue
         if valid:
             acc.cookies = updated_cookies
             acc.save_cookies()
@@ -129,8 +186,8 @@ def _validate_accounts(mgr: xhs_accounts.AccountManager) -> None:
         else:
             # 尝试自动恢复（Profile Session 恢复 → win-native）
             import xhs_keepalive
-            status = xhs_keepalive.keepalive_single_account(alias, acc)
-            if "失败" in status:
+            success, status = xhs_keepalive.keepalive_single_account(alias, acc)
+            if not success:
                 acc.mark_invalid()
                 print(f"  [{alias:15s}] 自动恢复失败（已标记冷却）", file=sys.stderr)
             else:
@@ -143,8 +200,8 @@ def _make_fetcher(args: argparse.Namespace) -> Fetcher:
     mgr = xhs_accounts.AccountManager()
     if not mgr.has_accounts():
         print("[CLI] 未找到任何账号，开始登录到 default...", file=sys.stderr)
-        cookies = xhs_login.acquire_cookies(prefer="auto")
-        xhs_login.persist_cookies(cookies)
+        cookies, cookie_meta = xhs_login.acquire_cookies(prefer="auto")
+        xhs_login.persist_cookies(cookies, cookie_meta)
         # 重新加载
         mgr = xhs_accounts.AccountManager()
     # 1.5 启动预检：在线验证所有账号 cookie
@@ -155,17 +212,14 @@ def _make_fetcher(args: argparse.Namespace) -> Fetcher:
     proxy_pool = xhs_proxy.ProxyPool([proxies_arg] if proxies_arg else None)
     if proxy_pool.is_active():
         print(f"[CLI] 代理池启用：{len(proxy_pool)} 个", file=sys.stderr)
-    # 3. signer / speed（账号专属速率优先于 CLI 参数）
+    # 3. signer / speed（统一 paranoid 速度）
     acc = mgr.get(force)
-    effective_speed = acc.speed_mode or args.speed_mode
-    if effective_speed != args.speed_mode:
-        print(f"[CLI] 账号 {acc.alias} 使用专属速率: {effective_speed}", file=sys.stderr)
     signer = xhs_sign.make_signer(args.sign_mode)
-    speed = xhs_config.SPEED_PROFILES[effective_speed]
+    speed = xhs_config.SPEED_PROFILES["paranoid"]
     return Fetcher(signer, speed, mgr, proxy_pool,
                     force_account=force,
                     sign_mode_label=args.sign_mode,
-                    speed_mode_label=effective_speed)
+                    speed_mode_label="paranoid")
 
 
 # ---------------------------------------------------------------------------
@@ -195,16 +249,17 @@ def fetch_session(args) -> Generator[tuple[Fetcher, sqlite3.Connection], None, N
 
 def cmd_login(args: argparse.Namespace) -> int:
     name = getattr(args, "name", None) or ""
-    cookies = xhs_login.acquire_cookies(prefer=args.prefer, headless_qr=False, profile_hint=name)
+    cookies, cookie_meta = xhs_login.acquire_cookies(prefer=args.prefer, headless_qr=False, profile_hint=name)
     if args.name and args.name != "default":
         # 多账号：落到 data/accounts/<name>.json
         xhs_config.ACCOUNTS_DIR.mkdir(parents=True, exist_ok=True)
         path = xhs_config.ACCOUNTS_DIR / f"{args.name}.json"
-        path.write_text(json.dumps(cookies, ensure_ascii=False, indent=2), encoding="utf-8")
+        data = {"_version": 2, "cookies": cookies, "cookie_meta": cookie_meta}
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         xhs_config.restrict_file(path)
         print(f"[OK] 已保存 {len(cookies)} 个 cookie 到 {path}（账号别名: {args.name}）")
     else:
-        xhs_login.persist_cookies(cookies)
+        xhs_login.persist_cookies(cookies, cookie_meta)
         print(f"[OK] 已保存 {len(cookies)} 个 cookie 到 {xhs_config.COOKIES_PATH}")
     return 0
 
@@ -214,26 +269,16 @@ def cmd_accounts(args: argparse.Namespace) -> int:
     if not mgr.has_accounts():
         print("无账号。先跑 `login` 或 `login --name <alias>`。")
         return 0
-    # --set-speed: 设置账号专属速率
+    # --set-speed 已废弃：现在只有 paranoid 一档
     set_speed = getattr(args, 'set_speed', None)
     if set_speed:
-        alias, _, mode = set_speed.partition("=")
-        if not mode or mode not in xhs_config.SPEED_PROFILES:
-            print(f"[ERR] 用法: --set-speed alias=mode（mode: {', '.join(xhs_config.SPEED_PROFILES.keys())}）")
-            return 1
-        if alias not in mgr.accounts:
-            print(f"[ERR] 未知账号: {alias}（可用: {', '.join(mgr.accounts.keys())}）")
-            return 1
-        mgr.accounts[alias].speed_mode = mode
-        mgr.save_state()
-        print(f"[OK] {alias} 专属速率已设为 {mode}")
+        print("[INFO] 速度模式已统一为 paranoid，--set-speed 不再需要", file=sys.stderr)
     print(f"=== 共 {len(mgr.accounts)} 个账号 ===")
     for s in mgr.stats():
         cd = f"cooldown→{s['cooldown_until']}" if s['cooldown_until'] else ""
         acc = mgr.accounts[s['alias']]
-        spd = f"速率:{acc.speed_mode}" if acc.speed_mode else ""
         print(f"  [{s['alias']:15s}] 日抓 {s['daily_count']:3d}/{xhs_config.DAILY_HARD_CAP}  累计 {s['total_calls']:5d}"
-              f"  460×{s['last_460']}  461×{s['last_461']}  {spd}  最近用 {s['last_used'] or '从未'}  {cd}")
+              f"  460×{s['last_460']}  461×{s['last_461']}  最近用 {s['last_used'] or '从未'}  {cd}")
     return 0
 
 
@@ -244,7 +289,8 @@ def cmd_stats(args: argparse.Namespace) -> int:
 
 
 def cmd_sign_test(args: argparse.Namespace) -> int:
-    cookies = xhs_login.load_cookies() or {}
+    loaded = xhs_login.load_cookies()
+    cookies = loaded[0] if loaded else {}
     a1 = cookies.get("a1")
     results = xhs_sign.run_sign_test(a1=a1)
     ok_any = any(results.values())
@@ -254,6 +300,15 @@ def cmd_sign_test(args: argparse.Namespace) -> int:
 def cmd_update_js(args: argparse.Namespace) -> int:
     import xhs_update_js
     return xhs_update_js.run_update_js(dry_run=getattr(args, "dry_run", False))
+
+
+def cmd_update_fp(args: argparse.Namespace) -> int:
+    """全量更新 UA/指纹池/TLS/签名JS。"""
+    project_root = str(Path(__file__).resolve().parent.parent)
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
+    from updater import run
+    return 0 if run(dry_run=getattr(args, "dry_run", False)) else 1
 
 
 def _refresh_single_account(alias: str, acc: xhs_accounts.Account, force: bool = False) -> str:
@@ -271,8 +326,9 @@ def _refresh_single_account(alias: str, acc: xhs_accounts.Account, force: bool =
     # 多账号时不能用 rookiepy（会从浏览器提取到当前登录账号的 cookie，而非目标账号的）
     print(f"  [{alias}] cookie {'已失效' if not valid else '强制刷新'}，尝试重新登录...", file=sys.stderr)
     try:
-        new_cookies = xhs_login.acquire_cookies(prefer="qr", profile_hint=alias)
+        new_cookies, new_meta = xhs_login.acquire_cookies(prefer="qr", profile_hint=alias)
         acc.cookies = new_cookies
+        acc.cookie_meta = new_meta
         acc.save_cookies()
         return "已重新登录（QR 扫码）"
     except xhs_login.LoginError as e:
@@ -312,32 +368,6 @@ def cmd_keepalive(args: argparse.Namespace) -> int:
     )
 
 
-def cmd_crawl_parallel(args: argparse.Namespace) -> int:
-    """多账号并行爬取。"""
-    import xhs_parallel
-    users = getattr(args, 'users', None) or []
-    keywords = getattr(args, 'keywords', None) or []
-    if users:
-        return xhs_parallel.run_parallel(
-            "user", users,
-            max_pages=args.max_pages,
-            speed_mode=args.speed_mode,
-            sign_mode=args.sign_mode,
-            download=getattr(args, 'download', False),
-            analyze=getattr(args, 'analyze', False),
-        )
-    elif keywords:
-        return xhs_parallel.run_parallel(
-            "search", keywords,
-            max_pages=args.max_pages,
-            speed_mode=args.speed_mode,
-            sign_mode=args.sign_mode,
-            download=getattr(args, 'download', False),
-            analyze=getattr(args, 'analyze', False),
-        )
-    else:
-        print("[ERR] 请指定 --users 或 --keywords", file=sys.stderr)
-        return 1
 
 
 def cmd_note(args: argparse.Namespace) -> int:
@@ -353,10 +383,36 @@ def cmd_note(args: argparse.Namespace) -> int:
                 print(f"[NOTE] 复用 DB 里 {args.note_id} 的 xsec_token（来源 {xsec_source}）",
                       file=sys.stderr)
         if not xsec_token:
-            print("[NOTE] ⚠️ 无 xsec_token，直访 detail 极易触发 461。建议先跑 search/user 获取。",
+            print("[NOTE] ⚠️ 无 xsec_token，直访 detail 极易触发 461。尝试搜索获取 token…",
                   file=sys.stderr)
+            # 自动降级：通过搜索发现该笔记，获取 xsec_token
+            try:
+                search_results = fetch_search(fetcher, args.note_id, page=1, page_size=5)
+                items = search_results.get("items") or search_results.get("data", {}).get("items") or []
+                for it in items:
+                    nid = it.get("id") or (it.get("note_card") or {}).get("note_id", "")
+                    if nid == args.note_id:
+                        xsec_token = it.get("xsec_token", "")
+                        xsec_source = it.get("xsec_source", "pc_search")
+                        if xsec_token:
+                            print(f"[NOTE] 通过搜索获取到 xsec_token（来源 {xsec_source}）",
+                                  file=sys.stderr)
+                            # 顺便存入 DB 供下次使用
+                            break
+            except Exception as e:
+                print(f"[NOTE] 搜索降级失败: {e}", file=sys.stderr)
+
+            if not xsec_token:
+                print("[NOTE] ❌ 无法获取 xsec_token（搜索未命中且 DB 无记录），停止请求以避免 461 风控。",
+                      file=sys.stderr)
+                print("[NOTE] 建议：先运行 search 或 user 命令让笔记入库（自带 token），再执行 note 命令。",
+                      file=sys.stderr)
+                return 1
 
         item = fetch_note_detail(fetcher, args.note_id, xsec_token=xsec_token, xsec_source=xsec_source)
+        if not item:
+            print(f"[NOTE] 笔记 {args.note_id} 不存在或已被删除", file=sys.stderr)
+            return
         note = _normalize_note(item)
         if not note["note_id"]:
             note["note_id"] = args.note_id
@@ -373,8 +429,39 @@ def cmd_note(args: argparse.Namespace) -> int:
         title = note.get("title") or note.get("description", "")[:30] or "(无标题)"
         print(f"[OK] 笔记入库并渲染: 《{title}》")
         print(f"     文件: {path.parent.name}/{path.name}")
-        # 自动下载图片
+        # 自动下载图片/视频
         xhs_media.auto_download_note(note, conn)
+        # 视频笔记自动分析（下载→转录→OCR→纠错）
+        if note.get("type") == "video":
+            try:
+                video_local = xhs_media.find_video_local(note["note_id"], conn)
+                if not video_local:
+                    # note detail API 返回完整数据，upsert_note 已写入 DB
+                    xhs_media.download_media(note["note_id"], conn, with_video=True)
+                    video_local = xhs_media.find_video_local(note["note_id"], conn)
+                if video_local and video_local.exists():
+                    import xhs_video
+                    cfg = xhs_video.load_config()
+                    result = xhs_video.analyze_video(video_local, cfg)
+                    ocr_text = json.dumps(result.get("ocr_results", []), ensure_ascii=False)
+                    xhs_storage.update_video_analysis(
+                        conn, note["note_id"],
+                        transcript=result.get("transcript", ""),
+                        ocr_text=ocr_text,
+                        summary="llm纠错" if result.get("corrected") else "",
+                    )
+                    parts = []
+                    if result.get("transcript"):
+                        parts.append(f"转录{len(result['transcript'])}字")
+                    if result.get("corrected"):
+                        parts.append("已纠错")
+                    if result.get("ocr_results"):
+                        parts.append(f"OCR {len(result['ocr_results'])}帧")
+                    if parts:
+                        print(f"     视频分析: {'、'.join(parts)}")
+                    xhs_storage.write_markdown(conn, note["note_id"])
+            except Exception as e:
+                print(f"     [WARN] 视频分析跳过: {e}", file=sys.stderr)
         summary = xhs_storage.render_update_summary(conn, note["note_id"])
         if summary:
             print(f"     状态: {summary}")
@@ -385,6 +472,12 @@ def cmd_user(args: argparse.Namespace) -> int:
     hb = Heartbeat()
     try:
         with fetch_session(args) as (fetcher, conn):
+            # 昵称 → user_id
+            resolved = xhs_storage.resolve_user_id(conn, args.user_id)
+            if resolved:
+                if resolved != args.user_id:
+                    print(f"[USER] 昵称「{args.user_id}」→ {resolved}")
+                args.user_id = resolved
             info = fetch_user_info(fetcher, args.user_id)
             if info:
                 info["user_id"] = args.user_id
@@ -404,10 +497,23 @@ def cmd_user(args: argparse.Namespace) -> int:
                 for item in items:
                     # user_posted 接口的 token 来源
                     item.setdefault("xsec_source", "pc_user")
-                    note = _normalize_note({"id": item.get("note_id") or item.get("id"),
-                                            "xsec_token": item.get("xsec_token", ""),
-                                            "xsec_source": "pc_user",
-                                            "note_card": item})
+                    note_id = item.get("note_id") or item.get("id")
+                    xsec_token = item.get("xsec_token", "")
+                    # 列表接口数据不完整，逐条调详情接口补全
+                    try:
+                        detail = fetch_note_detail(fetcher, note_id, xsec_token=xsec_token, xsec_source="pc_user")
+                        if not detail:
+                            raise ValueError("笔记不存在")
+                        note_card = detail.get("note_card") or detail
+                        note = _normalize_note(note_card)
+                    except Exception:
+                        # 详情失败则用列表数据兜底
+                        note = _normalize_note({
+                            "id": note_id,
+                            "xsec_token": xsec_token,
+                            "xsec_source": "pc_user",
+                            "note_card": item,
+                        })
                     if not note["note_id"]:
                         continue
                     note["user_id"] = args.user_id
@@ -714,7 +820,7 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
             try:
                 # 删除空记录 + 超龄记录
                 deleted_cache += conn.execute(
-                    "DELETE FROM search_cache WHERE note_ids = '' OR note_ids = '[]'"
+                    "DELETE FROM search_cache WHERE note_ids_json = '' OR note_ids_json = '[]'"
                 ).rowcount
                 deleted_cache += conn.execute(
                     "DELETE FROM search_cache WHERE crawled_at < datetime('now', ?)",
@@ -759,6 +865,67 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
         conn.close()
 
 
+def cmd_correct(args: argparse.Namespace) -> int:
+    """Agent 手动纠错视频转录：列出待纠错 / 读取单条 / 写回纠错结果。
+
+    用法:
+      correct --list [--limit N]              列出待纠错视频笔记
+      correct --note <id>                     打印单条 transcript + ocr（供纠错参照）
+      correct --note <id> --apply "<纠错后>"   写回 video_transcript，标记 video_summary='agent纠错'
+    """
+    conn = xhs_storage.connect()
+    try:
+        if getattr(args, "list", False):
+            limit = getattr(args, "limit", 50) or 50
+            rows = xhs_storage.list_pending_corrections(conn, limit=limit)
+            if not rows:
+                print("[CORRECT] 没有待纠错的视频笔记")
+                return 0
+            for r in rows:
+                print(f"--- {r['note_id']} | {r['title'] or '(无标题)'} ---")
+                print(f"[TRANSCRIPT]\n{r['video_transcript'] or ''}")
+                print(f"[OCR]\n{r['video_ocr_text'] or ''}")
+            print(f"\n[CORRECT] 共 {len(rows)} 条待纠错。"
+                  f"纠错后用：xhs.py correct --note <id> --apply \"<纠错后转录>\"")
+            return 0
+
+        note_id = getattr(args, "note", None)
+        if not note_id:
+            if getattr(args, "apply", None) is not None:
+                print("[ERROR] --apply 必须配合 --note <id> 使用", file=sys.stderr)
+            else:
+                print('用法: correct --list | --note <id> [--apply "<纠错后转录>"]',
+                      file=sys.stderr)
+            return 1
+
+        note = xhs_storage.get_note(conn, note_id)
+        if not note:
+            print(f"[ERROR] 笔记不存在: {note_id}", file=sys.stderr)
+            return 1
+
+        apply_text = getattr(args, "apply", None)
+        if apply_text is None:
+            # 只读：打印单条 transcript + ocr
+            print(f"--- {note['note_id']} | {note['title'] or '(无标题)'} ---")
+            print(f"[TRANSCRIPT]\n{note['video_transcript'] or ''}")
+            print(f"[OCR]\n{note['video_ocr_text'] or ''}")
+            return 0
+
+        # 写回：ocr_text 原样回填，避免 update_video_analysis 三参数覆盖清空 ocr
+        xhs_storage.update_video_analysis(
+            conn, note_id,
+            transcript=apply_text,
+            ocr_text=note["video_ocr_text"] or "",
+            summary="agent纠错",
+        )
+        print(f"[OK] 已写回纠错转录: {note_id} (video_summary=agent纠错)")
+        _try_pg_sync()  # 纠错是数据变更，写回后同步到 PG
+        _print_correction_hint()  # 提示剩余待纠错（让 Agent 知道是否还有未处理项）
+        return 0
+    finally:
+        conn.close()
+
+
 def cmd_refresh(args: argparse.Namespace) -> int:
     """重抓超过 N 小时的笔记（增量更新）。"""
     hb = Heartbeat()
@@ -782,6 +949,9 @@ def cmd_refresh(args: argparse.Namespace) -> int:
                 xsec_source = row["xsec_source"] or "pc_search"
                 try:
                     item = fetch_note_detail(fetcher, note_id, xsec_token=xsec_token, xsec_source=xsec_source)
+                    if not item:
+                        skipped += 1
+                        continue
                     note = _normalize_note(item)
                     note["note_id"] = note_id
                     if not note.get("xsec_token") and xsec_token:
@@ -811,6 +981,64 @@ def cmd_refresh(args: argparse.Namespace) -> int:
             return 0
     finally:
         hb.stop()
+
+
+def cmd_enrich(args: argparse.Namespace) -> int:
+    """补全搜索入库的半成品笔记（无标题/无详情数据的笔记）。
+
+    对通过 search 入库但未调详情 API 的笔记，逐条补全标题、描述、媒体等。
+    """
+    with fetch_session(args) as (fetcher, conn):
+        # 找出"半成品"笔记：标题为空 或 raw_json 很短（搜索摘要）
+        rows = conn.execute(
+            "SELECT note_id, xsec_token, xsec_source, raw_json FROM notes "
+            "WHERE (title = '' OR title IS NULL OR length(raw_json) < 200) "
+            "AND xsec_token IS NOT NULL AND xsec_token != '' "
+            "ORDER BY crawled_at DESC LIMIT ?",
+            (args.limit,),
+        ).fetchall()
+        if not rows:
+            print("[OK] 没有需要补全的半成品笔记")
+            return 0
+        print(f"[ENRICH] 找到 {len(rows)} 条半成品笔记需要补全", file=sys.stderr)
+
+        enriched = 0
+        failed = 0
+        for i, row in enumerate(rows, 1):
+            note_id = row["note_id"]
+            xsec_token = row["xsec_token"]
+            xsec_source = row["xsec_source"] or "pc_search"
+            try:
+                item = fetch_note_detail(fetcher, note_id,
+                                          xsec_token=xsec_token,
+                                          xsec_source=xsec_source)
+                if not item:
+                    failed += 1
+                    print(f"  [{i}/{len(rows)}] {note_id} 不存在或已删除")
+                    continue
+                note = _normalize_note(item)
+                note["note_id"] = note_id
+                if not note.get("xsec_token"):
+                    note["xsec_token"] = xsec_token
+                    note["xsec_source"] = xsec_source
+                xhs_storage.upsert_note(conn, note)
+                if note["user_id"]:
+                    user = (item.get("note_card") or {}).get("user") or {}
+                    user["user_id"] = note["user_id"]
+                    xhs_storage.upsert_user(conn, _normalize_user(user))
+                conn.commit()
+                enriched += 1
+                title = note.get("title", "")[:40] or "(无标题)"
+                print(f"  [{i}/{len(rows)}] {note_id} 《{title}》")
+            except (FatalRiskError, KeyboardInterrupt):
+                raise
+            except Exception as e:
+                failed += 1
+                print(f"  [{i}/{len(rows)}] {note_id} 失败: {e}", file=sys.stderr)
+
+        print(f"[ENRICH] 完成: {enriched} 条补全, {failed} 条失败", file=sys.stderr)
+        print(f'__CRAWL_METRICS__:{{"items_found":{len(rows)},"items_new":{enriched},"items_failed":{failed}}}')
+        return 0
 
 
 def cmd_export(args: argparse.Namespace) -> int:
@@ -967,6 +1195,7 @@ def cmd_crawl_feed(args: argparse.Namespace) -> int:
                     cursor_score, "completed", "",
                 )
                 print(f"[OK] crawl-feed ({category_key}) 完成：{total} 条新增")
+                print(f'__CRAWL_METRICS__:{{"items_found":{total},"items_new":{total},"items_failed":0}}')
                 return 0
             except FatalRiskError as e:
                 xhs_storage.update_crawl_state(
@@ -1038,6 +1267,7 @@ def cmd_crawl_search(args: argparse.Namespace) -> int:
 
             total = 0
             last_page = start_page - 1
+            page = start_page
             try:
                 for page in range(start_page, args.max_pages + 1):
                     data = fetch_search(fetcher, args.keyword, page=page)
@@ -1063,7 +1293,7 @@ def cmd_crawl_search(args: argparse.Namespace) -> int:
                     last_page = page
                     xhs_storage.update_crawl_state(
                         conn, task_id, "search", args.keyword,
-                        str(page + 1), "running", "",
+                        str(page), "running", "",
                     )
                     print(f"  [page {page}] +{len(note_ids)} 入库，累计 {total}", file=sys.stderr)
                     if not data.get("has_more"):
@@ -1075,12 +1305,13 @@ def cmd_crawl_search(args: argparse.Namespace) -> int:
                     str(last_page + 1), "completed", "",
                 )
                 print(f"[OK] crawl-search '{args.keyword}' 完成：{total} 条新增（下次 --resume 从 page {last_page + 1}）")
+                print(f'__CRAWL_METRICS__:{{"items_found":{total},"items_new":{total},"items_failed":0}}')
                 return 0
             except FatalRiskError as e:
-                paused_page = page if 'page' in dir() else last_page + 1
+                paused_page = page
                 xhs_storage.update_crawl_state(
                     conn, task_id, "search", args.keyword,
-                    str(max(paused_page, last_page + 1)), "paused", str(e),
+                    str(paused_page), "paused", str(e),
                 )
                 print(f"[PAUSED] 在第 {paused_page} 页因风控暂停：{e}\n下次用 --resume 继续。", file=sys.stderr)
                 return 2
@@ -1093,6 +1324,12 @@ def cmd_crawl_user(args: argparse.Namespace) -> int:
     hb = Heartbeat()
     try:
         with fetch_session(args) as (fetcher, conn):
+            # 昵称 → user_id
+            resolved = xhs_storage.resolve_user_id(conn, args.user_id)
+            if resolved:
+                if resolved != args.user_id:
+                    print(f"[USER] 昵称「{args.user_id}」→ {resolved}")
+                args.user_id = resolved
             task_id = f"user:{args.user_id}:{fetcher.account.alias}"
             cursor = ""
             if args.resume:
@@ -1121,12 +1358,23 @@ def cmd_crawl_user(args: argparse.Namespace) -> int:
                         break
                     for item in items:
                         item.setdefault("xsec_source", "pc_user")
-                        note = _normalize_note({
-                            "id": item.get("note_id") or item.get("id"),
-                            "xsec_token": item.get("xsec_token", ""),
-                            "xsec_source": "pc_user",
-                            "note_card": item,
-                        })
+                        note_id = item.get("note_id") or item.get("id")
+                        xsec_token = item.get("xsec_token", "")
+                        # 列表接口数据不完整，逐条调详情接口补全
+                        try:
+                            detail = fetch_note_detail(fetcher, note_id, xsec_token=xsec_token, xsec_source="pc_user")
+                            if not detail:
+                                raise ValueError("笔记不存在")
+                            note_card = detail.get("note_card") or detail
+                            note = _normalize_note(note_card)
+                        except Exception:
+                            # 详情失败则用列表数据兜底
+                            note = _normalize_note({
+                                "id": note_id,
+                                "xsec_token": xsec_token,
+                                "xsec_source": "pc_user",
+                                "note_card": item,
+                            })
                         if not note["note_id"]:
                             continue
                         note["user_id"] = args.user_id
@@ -1147,6 +1395,7 @@ def cmd_crawl_user(args: argparse.Namespace) -> int:
                     conn, task_id, "user", args.user_id, cursor, "completed", "",
                 )
                 print(f"[OK] crawl-user {args.user_id} 完成：{total} 条新增")
+                print(f'__CRAWL_METRICS__:{{"items_found":{total},"items_new":{total},"items_failed":0}}')
                 return 0
             except FatalRiskError as e:
                 xhs_storage.update_crawl_state(
@@ -1164,13 +1413,15 @@ def cmd_crawl_user(args: argparse.Namespace) -> int:
 
 def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--sign-mode", choices=["auto", "embed-js", "playwright", "py-port"], default="auto")
-    p.add_argument("--speed-mode", choices=list(xhs_config.SPEED_PROFILES.keys()), default="paranoid")
+    p.add_argument("--speed-mode", choices=["paranoid"], default="paranoid",
+                    help="速度模式（当前仅支持 paranoid）")
     p.add_argument("--proxy", default=None)
     p.add_argument("--account", default=None, help="指定账号别名")
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="xhs", description="小红书爬虫 CLI")
+    p.add_argument("--version", action="version", version=f"xiaohongshu-scraper v{__version__}")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     p_setup = sub.add_parser("setup", help="安装所有依赖（首次运行自动触发，此命令用于排查）")
@@ -1181,8 +1432,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_login = sub.add_parser("login", help="获取并保存 cookie")
     p_login.add_argument("--prefer",
-                          choices=["auto", "rookie", "edge", "chrome", "native",
-                                   "native-edge", "native-chrome",
+                          choices=["auto", "rookie", "edge", "chrome", "firefox", "brave",
+                                   "native", "native-edge", "native-chrome",
+                                   "native-firefox", "native-brave",
                                    "wsl-edge", "wsl-edge-cdp",
                                    "wsl-chrome", "wsl-chrome-cdp", "qr", "manual"],
                           default="auto",
@@ -1251,18 +1503,6 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common(p_cu)
     p_cu.set_defaults(func=cmd_crawl_user)
 
-    p_par = sub.add_parser("crawl-parallel", help="多账号并行爬取（每个账号一个任务同时跑）")
-    p_par.add_argument("--users", nargs="+", default=[], help="用户 ID 列表（每个账号爬一个用户）")
-    p_par.add_argument("--keywords", nargs="+", default=[], help="关键词列表（每个账号搜一个关键词）")
-    p_par.add_argument("--max-pages", type=int, default=5)
-    p_par.add_argument("--download", action="store_true", default=True, help="自动下载媒体（默认开启）")
-    p_par.add_argument("--analyze", action="store_true", default=True, help="自动内容分析（默认开启）")
-    p_par.add_argument("--no-download", action="store_false", dest="download", help="跳过下载")
-    p_par.add_argument("--no-analyze", action="store_false", dest="analyze", help="跳过分析")
-    p_par.add_argument("--sign-mode", choices=["auto", "embed-js", "playwright", "py-port"], default="auto")
-    p_par.add_argument("--speed-mode", choices=list(xhs_config.SPEED_PROFILES.keys()), default="paranoid")
-    p_par.set_defaults(func=cmd_crawl_parallel)
-
     p_clean = sub.add_parser("cleanup", help="数据清理：孤儿媒体、过期缓存")
     p_clean.add_argument("--dry-run", action="store_true", help="只显示要删除的内容")
     p_clean.add_argument("--max-cache-days", type=int, default=30, help="清理 N 天前的空搜索缓存（默认 30）")
@@ -1270,11 +1510,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_clean.add_argument("--vacuum", action="store_true", help="SQLite VACUUM 压缩数据库")
     p_clean.set_defaults(func=cmd_cleanup)
 
+    p_corr = sub.add_parser("correct", help="Agent 手动纠错视频转录：列出/读取/写回")
+    mx_corr = p_corr.add_mutually_exclusive_group()
+    mx_corr.add_argument("--list", action="store_true", help="列出待纠错视频笔记")
+    mx_corr.add_argument("--note", default=None, help="指定 note_id（读取或写回；与 --list 互斥）")
+    p_corr.add_argument("--limit", type=int, default=50, help="--list 时最大条数（默认 50）")
+    p_corr.add_argument("--apply", default=None, help="纠错后的转录文本（写回 video_transcript，标记 agent纠错；须配 --note）")
+    p_corr.set_defaults(func=cmd_correct)
+
     p_ref = sub.add_parser("refresh", help="重抓超过 N 小时的旧笔记（增量更新）")
     p_ref.add_argument("--max-age-hours", type=int, default=24, help="重抓 N 小时前的笔记（默认 24）")
     p_ref.add_argument("--limit", type=int, default=100, help="最多刷新几条（默认 100）")
     _add_common(p_ref)
     p_ref.set_defaults(func=cmd_refresh)
+
+    p_enr = sub.add_parser("enrich", help="补全搜索入库的半成品笔记（逐条调详情 API）")
+    p_enr.add_argument("--limit", type=int, default=50, help="最多补全几条（默认 50）")
+    _add_common(p_enr)
+    p_enr.set_defaults(func=cmd_enrich)
 
     p_exp = sub.add_parser("export", help="从 DB 导出 MD/CSV/JSON/XLSX")
     p_exp.add_argument("--format", choices=["md", "csv", "json", "xlsx"], default="csv")
@@ -1295,6 +1548,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_ujs = sub.add_parser("update-js", help="从 cv-cat/Spider_XHS 拉取最新签名 JS")
     p_ujs.add_argument("--dry-run", action="store_true", help="只检查不覆盖")
     p_ujs.set_defaults(func=cmd_update_js)
+
+    p_ufp = sub.add_parser("update-fp", help="全量更新 UA/指纹池/TLS/签名JS")
+    p_ufp.add_argument("--dry-run", action="store_true", help="只检查不写入")
+    p_ufp.set_defaults(func=cmd_update_fp)
 
     p_feed = sub.add_parser("feed", help="推荐流 / 分类流浏览")
     p_feed.add_argument("--category", choices=list(xhs_config.FEED_CATEGORIES.keys()), default="recommend")
@@ -1335,87 +1592,336 @@ def build_parser() -> argparse.ArgumentParser:
     p_az.add_argument("--output", choices=["text", "json"], default="text", help="输出格式")
     p_az.set_defaults(func=cmd_analyze)
 
-    p_av = sub.add_parser("analyze-video", help="视频内容智能分析（语音转文字 + OCR + AI 摘要）")
+    p_av = sub.add_parser("analyze-video", help="视频内容智能分析（语音转文字 + OCR；转录需 Agent 用 correct 纠错）")
     p_av.add_argument("note_id", help="视频笔记 ID（需已入库）")
-    p_av.add_argument("--mode", choices=["none", "local", "ollama", "openai", "mcp"], default=None,
-                      help="AI 摘要模式（覆盖配置文件）")
+    p_av.add_argument("--correct-mode", choices=["auto", "openai", "ollama", "none"], default=None,
+                      help="LLM 纠错模式（覆盖配置文件）")
     p_av.add_argument("--whisper-model", default=None, help="Whisper 模型（tiny/base/small/medium/large-v3）")
     p_av.add_argument("--frame-interval", type=int, default=None, help="关键帧间隔秒数")
     p_av.add_argument("--max-duration", type=int, default=None,
                       help="最多转录前 N 秒音频（默认 300，0=不限制）")
     p_av.add_argument("--step", nargs="*", default=None,
-                      help="分段执行: extract transcribe ocr summary（不传=全部执行）")
+                      help="分段执行: extract transcribe ocr（不传=全部执行）")
     _add_common(p_av)
     p_av.set_defaults(func=cmd_analyze_video)
 
     p_sv = sub.add_parser("setup-video", help="交互式配置视频分析")
-    p_sv.add_argument("--mode", choices=["none", "local", "ollama", "openai", "mcp"], default=None,
-                      help="直接指定 AI 摘要模式（跳过交互）")
+    p_sv.add_argument("--correct-mode", choices=["auto", "openai", "ollama", "none"], default=None,
+                      help="直接指定 LLM 纠错模式（跳过交互）")
     p_sv.add_argument("--whisper-model", default=None, help="直接指定 Whisper 模型")
     p_sv.add_argument("--frame-interval", type=int, default=None, help="关键帧间隔秒数")
     p_sv.set_defaults(func=cmd_setup_video)
 
-    p_ai = sub.add_parser("analyze-images", help="图片内容智能分析（OCR + AI 视觉 + Mermaid）")
+    p_ai = sub.add_parser("analyze-images", help="图片 OCR 文字提取")
     p_ai.add_argument("note_id", help="图文笔记 ID（需已入库）")
-    p_ai.add_argument("--mode", choices=["auto", "none", "local", "vision"], default=None,
-                      help="分析模式（覆盖配置文件）")
-    p_ai.add_argument("--backend", choices=["ollama", "api", "mcp"], default=None,
-                      help="视觉后端（覆盖配置文件）")
-    p_ai.add_argument("--no-mermaid", action="store_true", help="关闭 Mermaid 图表生成")
-    p_ai.add_argument("--step", nargs="*", default=None,
-                      help="分段执行: ocr vision mermaid（不传=全部执行）。"
-                           "适合终端 timeout 60s 的环境")
     _add_common(p_ai)
     p_ai.set_defaults(func=cmd_analyze_images)
-
-    p_si = sub.add_parser("setup-image", help="交互式配置图片分析")
-    p_si.add_argument("--mode", choices=["auto", "none", "local", "vision"], default=None,
-                      help="直接指定分析模式（跳过交互）")
-    p_si.add_argument("--backend", choices=["ollama", "api", "mcp"], default=None,
-                      help="直接指定视觉后端（跳过交互）")
-    p_si.add_argument("--no-mermaid", action="store_true", help="关闭 Mermaid 图表")
-    p_si.set_defaults(func=cmd_setup_image)
 
     p_sw = sub.add_parser("setup-wizard", help="统一引导向导：配置图片+视频分析")
     p_sw.set_defaults(func=cmd_setup_wizard)
 
+    # ---- run ----
+    p_run = sub.add_parser("run", help="按需执行模式：单次搜索+提取，用完即停（比 serve 更安全）")
+    p_run.add_argument("--keywords", default="", required=True,
+                        help="搜索关键词，逗号分隔（如 'AI工具,AI编程'）")
+    p_run.add_argument("--max-notes", type=int, default=20,
+                        help="每关键词最多提取笔记数（默认20）")
+    p_run.add_argument("--pages", type=int, default=2,
+                        help="每关键词最多搜索页数（默认2）")
+    _add_common(p_run)  # 包含 --account --sign-mode --speed-mode --proxy
+    p_run.set_defaults(func=cmd_run)
+
+    # ---- serve ----
+    p_serve = sub.add_parser("serve", help="守护进程模式：自动循环爬取")
+    p_serve.add_argument("--interval", type=float, default=6, help="爬取间隔（小时，默认6，支持小数如0.1=6分钟）")
+    p_serve.add_argument("--max-pages", type=int, default=5, help="每次最多爬取页数（默认5）")
+    p_serve.add_argument("--targets", nargs="+", default=[],
+                         help="爬取目标列表（user:uid / feed:category / search:kw）")
+    p_serve.add_argument("--proxy", default=None, help="代理 URL（如 http://host:port）")
+    p_serve.set_defaults(func=cmd_serve)
+
     return p
+
+
+def cmd_run(args):
+    """按需执行模式：单次搜索+提取，执行完即退出。
+
+    与 serve 守护模式的核心区别：
+    - serve：持续运行，累积行为 profile → 2-3天被检测
+    - run：单次任务（30-60分钟），完成后彻底停止 → 无累积 profile
+
+    流程：
+    1. 自动选最久未用的可用账号（由 _make_fetcher → next_available 处理）
+    2. 设置搜索模式为浏览器 DOM（降低 API 指纹暴露）
+    3. 搜索关键词 → 提取 note_id
+    4. API 获取笔记详情 + 输出结果
+    5. 彻底关闭浏览器 → 退出
+    """
+    import datetime as _dt
+
+    # ---- 1. 解析关键词 ----
+    keywords = [kw.strip() for kw in args.keywords.split(",") if kw.strip()]
+    if not keywords:
+        print("[RUN] 错误：至少需要一个关键词", file=sys.stderr)
+        return 2
+    print(f"[RUN] 关键词: {keywords}")
+    print(f"[RUN] 每关键词最多 {args.max_notes} 条笔记，最多 {args.pages} 页")
+    print(f"[RUN] 模式：浏览器 DOM 搜索 + API 详情获取")
+
+    # ---- 2. 设置浏览器 DOM 搜索模式 ----
+    xhs_config.SEARCH_MODE = "dom"
+    print(f"[RUN] 搜索模式: {xhs_config.SEARCH_MODE}")
+
+    # ---- 3. 执行搜索 + 提取（账号由 fetch_session 自动选择最久未用） ----
+    hb = Heartbeat()
+    try:
+        with fetch_session(args) as (fetcher, conn):
+            total_notes = 0
+            for kw_idx, keyword in enumerate(keywords):
+                if total_notes >= args.max_notes * len(keywords):
+                    break
+                print(f"\n[RUN] [{kw_idx+1}/{len(keywords)}] 搜索: '{keyword}'")
+                note_ids: list[str] = []
+                for page in range(1, args.pages + 1):
+                    try:
+                        data = fetch_search(fetcher, keyword, page=page)
+                    except Exception as e:
+                        print(f"[RUN] 搜索失败 page={page}: {e}", file=sys.stderr)
+                        break
+                    items = data.get("items") or []
+                    if not items:
+                        print(f"[RUN] page={page} 无结果，停止翻页")
+                        break
+                    for item in items:
+                        if item.get("model_type") != "note":
+                            continue
+                        item.setdefault("xsec_source", "pc_search")
+                        note = _normalize_note(item)
+                        if not note["note_id"]:
+                            continue
+                        xhs_storage.upsert_note(conn, note)
+                        _try_upsert_user_from_note(note, conn)
+                        note_ids.append(note["note_id"])
+                        total_notes += 1
+                        preview = _desc_preview(note)
+                        print(f"  [{total_notes}] {note['note_id']} {preview}")
+                        if len(note_ids) >= args.max_notes:
+                            break
+                    xhs_storage.save_search_page(conn, keyword, page, note_ids)
+                    conn.commit()
+                    if len(note_ids) >= args.max_notes or not data.get("has_more"):
+                        break
+                print(f"[RUN] '{keyword}' 完成：找到 {len(note_ids)} 条笔记")
+
+            print(f"\n[RUN] 全部完成：共 {total_notes} 条笔记")
+
+            # ---- 4. 记录账号使用（last_used 已由 mark_used 自动更新） ----
+            try:
+                alias = getattr(fetcher.account, 'alias', None)
+                if alias:
+                    mgr = xhs_accounts.AccountManager()
+                    mgr.save_state()
+                    print(f"[RUN] 账号 {alias} 使用完成，建议休息 4-6 小时后再用")
+            except Exception:
+                pass
+
+            return 0
+    finally:
+        hb.stop()
+        # 恢复默认搜索模式（DOM 优先）
+        xhs_config.SEARCH_MODE = "dom"
+
+
+def cmd_serve(args):
+    """守护进程模式：自动循环爬取。每轮：健康检查 → keepalive → 爬取 → 休息。
+    """
+    import signal
+    import time as _time
+    import json as _json
+
+    base_s = args.interval * 3600
+
+    def _random_interval(base: float) -> float:
+        """对数正态随机间隔，20% 概率长休息，最短 8 分钟。"""
+        if random.random() < 0.20:
+            interval = base * random.uniform(2.0, 3.5)
+        else:
+            interval = base * random.lognormvariate(0, 0.3)
+        return max(interval, 480)
+
+    interval_s = _random_interval(base_s)
+
+    stop = [False]
+    def _stop(sig, frame):
+        print("\n[serve] 收到停止信号，等当前任务完成...")
+        stop[0] = True
+    signal.signal(signal.SIGINT, _stop)
+    if hasattr(signal, 'SIGTERM'):
+        signal.signal(signal.SIGTERM, _stop)
+
+    print(f"[serve] 启动，基准间隔 {args.interval}h（随机抖动），每轮最多 {args.max_pages} 页")
+
+    # 强制 DOM 搜索模式（守护进程必须走浏览器，降低风控风险）
+    xhs_config.SEARCH_MODE = "dom"
+    print(f"[serve] 搜索模式: {xhs_config.SEARCH_MODE}")
+
+    while not stop[0]:
+        print(f"\n{'='*50}")
+        print(f"[serve] 新一轮开始 {time.strftime('%Y-%m-%d %H:%M:%S')}")
+
+        # 1. Keepalive: 尝试刷新 cookie
+        mgr = xhs_accounts.AccountManager()
+        try:
+            import xhs_keepalive
+            xhs_keepalive.keepalive_all(mgr, force=True)
+            print("[serve] Keepalive 完成")
+        except Exception as e:
+            print(f"[serve] Keepalive 失败: {e}")
+
+        # 2. 获取目标
+        targets = args.targets
+        if not targets:
+            print("[serve] 无可爬目标，请通过 --targets user:uid1 user:uid2 ... 指定")
+            _xhs_sleep_or_stop(stop, interval_s)
+            continue
+        print(f"[serve] 目标列表: {targets}")
+
+        # 3. 串行爬取：逐目标执行，轮换账号
+        for idx, target_ident in enumerate(targets):
+            if stop[0]:
+                break
+            # 每次循环前刷新可用账号列表（上一个目标可能触发冷却）
+            aliases = [a for a, acc in mgr.accounts.items() if acc.is_available()[0]]
+            if not aliases:
+                print("[serve] 所有账号已进入冷却，跳过剩余目标")
+                break
+            if ":" in target_ident:
+                kind, value = target_ident.split(":", 1)
+            else:
+                kind, value = "search", target_ident
+
+            account = aliases[idx % len(aliases)]
+            print(f"\n[serve] 爬取 {kind}:{value} (max_pages={args.max_pages}, account={account})")
+
+            try:
+                if kind == "search":
+                    crawl_args = argparse.Namespace(
+                        cmd="crawl-search", keyword=value,
+                        max_pages=args.max_pages, resume=True,
+                        download=False, analyze=False,
+                        sign_mode="auto", speed_mode="paranoid",
+                        proxy=args.proxy, account=account,
+                    )
+                    cmd_crawl_search(crawl_args)
+                elif kind == "feed":
+                    crawl_args = argparse.Namespace(
+                        cmd="crawl-feed", category=value or "recommend",
+                        max_pages=args.max_pages, resume=True,
+                        download=False, analyze=False,
+                        sign_mode="auto", speed_mode="paranoid",
+                        proxy=args.proxy, account=account,
+                    )
+                    cmd_crawl_feed(crawl_args)
+                elif kind == "user":
+                    crawl_args = argparse.Namespace(
+                        cmd="crawl-user", user_id=value,
+                        max_pages=args.max_pages, resume=True,
+                        download=False, analyze=False,
+                        sign_mode="auto", speed_mode="paranoid",
+                        proxy=args.proxy, account=account,
+                    )
+                    cmd_crawl_user(crawl_args)
+            except Exception as e:
+                print(f"[serve] 爬取失败: {e}")
+                _write_serve_alert("xiaohongshu", f"爬取 {target_ident} 失败: {e}")
+
+        # 5. 随机休息
+        interval_s = _random_interval(base_s)
+        minutes = interval_s / 60
+        print(f"\n[serve] 本轮结束，随机休息 {minutes:.0f} 分钟后开始下一轮")
+        _xhs_sleep_or_stop(stop, interval_s)
+
+    print("[serve] 已停止")
+    return 0
+
+
+def _write_serve_alert(source_type, message, action=""):
+    try:
+        alert_path = Path(__file__).resolve().parent.parent / "crawler_alerts.jsonl"
+        record = {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "source_type": source_type,
+            "severity": "expired",
+            "message": message[:300],
+            "action_required": action,
+        }
+        with open(str(alert_path), "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _xhs_sleep_or_stop(stop, seconds):
+    elapsed = 0
+    chunk = min(10, seconds) if seconds > 0 else 10
+    while elapsed < seconds:
+        if stop[0]:
+            return
+        sleep_time = min(chunk, seconds - elapsed)
+        time.sleep(sleep_time)
+        elapsed += sleep_time
 
 
 def main(argv: list[str] | None = None) -> int:
     # Fix Windows console encoding for Unicode output
     if sys.platform == "win32":
         try:
-            sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-            sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
         except Exception:
             pass
 
-    # 注册 SIGTERM：确保 PID 文件被清理
+    # 注册 SIGTERM：收到终止信号时优雅退出（本进程不写 PID 文件）
     import signal
     def _sigterm_handler(sig, frame):
-        xhs_storage._release_lock()
         sys.exit(143)
-    signal.signal(signal.SIGTERM, _sigterm_handler)
+    if hasattr(signal, 'SIGTERM'):
+        signal.signal(signal.SIGTERM, _sigterm_handler)
 
     # 首次运行自动安装依赖（延迟到 main() 而非模块级，避免 import 副作用）
     xhs_bootstrap.ensure_ready()
 
     parser = build_parser()
     args = parser.parse_args(argv)
+    rc = 0
     try:
-        return args.func(args)
+        rc = args.func(args)
     except FatalRiskError as e:
         print(f"[FATAL] {e}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:
-        xhs_storage._release_lock()
         print("\n[ABORT] 用户中断", file=sys.stderr)
         return 130
     except Exception as e:
         print(f"[ERR] {e}", file=sys.stderr)
         traceback.print_exc()
         return 1
+
+    # 命令成功后自动尝试同步到 PG（仅数据写入类命令）
+    _SYNC_COMMANDS = {"note", "user", "search", "crawl-search", "crawl-user",
+                       "crawl-feed", "feed", "comments", "download", "refresh",
+                       "enrich", "run", "serve"}
+    if (rc == 0 or rc is None) and getattr(args, 'func', None):
+        cmd_name = getattr(args.func, '__name__', '') or ''
+        # cmd_name 格式: cmd_xxx
+        base_cmd = cmd_name.replace('cmd_', '').replace('_', '-')
+        if base_cmd in _SYNC_COMMANDS:
+            _try_pg_sync()
+            # 只在带 --analyze 的命令后提示纠错（减噪：download/comments/feed 等不提示）
+            if getattr(args, "analyze", False):
+                _print_correction_hint()
+
+    return rc if rc else 0
 
 
 if __name__ == "__main__":

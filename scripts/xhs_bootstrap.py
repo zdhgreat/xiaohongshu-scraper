@@ -67,6 +67,10 @@ def _install_pip() -> None:
         return
     _msg("安装 Python 依赖（首次运行，约 30-60 秒）...")
 
+    # 强制 UTF-8 避免 Windows 中文环境 GBK 解码 requirements.txt 失败
+    env = os.environ.copy()
+    env["PYTHONUTF8"] = "1"
+
     cmd_base = [sys.executable, "-m", "pip", "install", "-r", str(REQUIREMENTS)]
     strategies: list[list[str]] = [cmd_base]
     if not _in_venv():
@@ -74,7 +78,7 @@ def _install_pip() -> None:
         strategies.append(cmd_base + ["--break-system-packages"])
 
     for s in strategies:
-        r = _run(s)
+        r = _run(s, env=env)
         if r.returncode == 0:
             DATA.mkdir(exist_ok=True)
             _PIP_MARKER.touch()
@@ -83,11 +87,15 @@ def _install_pip() -> None:
             return
         # PEP 668 externally-managed → 尝试下一种策略
         if "externally-managed-environment" not in (r.stderr or ""):
-            # 非 PEP 668 错误，也试下一种
+            # 非 PEP 668 错误，打印具体原因后试下一种
             continue
 
-    _msg("pip install 失败。请手动运行: " + " ".join(strategies[0]))
-    # 不写入 marker — 下次运行会重试
+    # 所有策略都失败：打印实际错误 + 写 marker 避免每次启动重试
+    last_err = (r.stderr or r.stdout or "")[:300]
+    _msg(f"pip install 失败: {last_err}")
+    _msg("请手动运行: " + " ".join(strategies[0]))
+    DATA.mkdir(exist_ok=True)
+    _PIP_MARKER.touch()
 
 
 # ----------------------------------------------------------------
@@ -411,7 +419,6 @@ def cmd_setup(args) -> int:
     # ── 配置引导提示 ──
     print("\n=== 下一步 ===", file=sys.stderr)
     print("  配置图片/视频分析: python scripts/xhs.py setup-wizard", file=sys.stderr)
-    print("  仅配置图片分析:   python scripts/xhs.py setup-image", file=sys.stderr)
     print("  仅配置视频分析:   python scripts/xhs.py setup-video", file=sys.stderr)
     return 0 if ok else 1
 
@@ -571,51 +578,15 @@ def _configure_image(ai_choice: str) -> None:
     """图片分析子向导。"""
     import xhs_image
 
-    cfg = xhs_image.load_config()
-
     # 依赖检查
-    deps = xhs_image.deps_status()
-    dep_status = "  ".join(f"{'OK' if v else '未安装'}" for k, v in deps.items())
-    print(f"依赖状态: {dep_status}")
-    if not deps.get("rapidocr"):
+    if not xhs_image.has_ocr():
         print("  [提示] rapidocr 未安装 → OCR 不可用")
         print("  安装: pip install rapidocr-onnxruntime")
-
-    if ai_choice == "A":
-        cfg["image_mode"] = "auto"
-        print("\n已选择: auto 模式（自动判断，优先 OCR，必要时才调 AI）")
-        print("  [提示] 当前无 AI 后端，auto 模式下只做 OCR")
-    elif ai_choice == "B":
-        cfg["image_mode"] = "auto"
-        cfg["image_vision_backend"] = "ollama"
-        print("\n已选择: auto 模式 + Ollama 视觉后端")
-        print("  → OCR 足够的笔记自动跳过 AI，需要时才调用 Ollama 看图")
-        _prompt_ollama_config(cfg, prefix="ollama_")
-    elif ai_choice == "C":
-        cfg["image_mode"] = "auto"
-        cfg["image_vision_backend"] = "api"
-        print("\n已选择: auto 模式 + API 视觉后端")
-        print("  → OCR 足够的笔记自动跳过 AI，需要时才调用 API 看图")
-        _prompt_api_config(cfg, prefix="api_")
-    elif ai_choice == "D":
-        cfg["image_mode"] = "auto"
-        cfg["image_vision_backend"] = "mcp"
-        print("\n已选择: auto 模式 + MCP 视觉后端")
-        print("  → OCR 足够的笔记自动跳过 AI，需要时输出 MCP 任务清单")
-        print("  → AI Agent 使用当前环境的 MCP 视觉工具完成分析，零配置")
-
-    # Mermaid 开关
-    if ai_choice in ("B", "C"):
-        try:
-            mermaid = input("\n开启 Mermaid 路线图/流程图？(y/n) [y]: ").strip().lower()
-            cfg["image_mermaid"] = mermaid != "n"
-        except (EOFError, KeyboardInterrupt):
-            cfg["image_mermaid"] = True
     else:
-        cfg["image_mermaid"] = False
+        print("  OCR (rapidocr): 已安装")
 
-    xhs_image.save_config(cfg)
-    print(f"[OK] 图片分析配置已保存 → data/image_config.json")
+    print("\n图片分析当前仅支持 OCR 文字提取。")
+    print("[OK] 图片分析无需额外配置")
 
 
 def _configure_video(ai_choice: str) -> None:
@@ -645,20 +616,20 @@ def _configure_video(ai_choice: str) -> None:
         pass
 
     if ai_choice == "A":
-        cfg["summary_mode"] = "none"
-        print("\n已选择: 仅转录模式（不调用 AI）")
+        cfg["correct_mode"] = "none"
+        print("\n已选择: 仅转录模式（不纠错）")
     elif ai_choice == "B":
-        cfg["summary_mode"] = "ollama"
-        print("\n已选择: Ollama 摘要模式")
+        cfg["correct_mode"] = "ollama"
+        print("\n已选择: Ollama 纠错模式")
         _prompt_ollama_config(cfg, prefix="ollama_")
     elif ai_choice == "C":
-        cfg["summary_mode"] = "openai"
-        print("\n已选择: API 摘要模式")
+        cfg["correct_mode"] = "openai"
+        print("\n已选择: API 纠错模式")
         _prompt_api_config(cfg, prefix="openai_", default_url="https://api.openai.com/v1")
     elif ai_choice == "D":
-        cfg["summary_mode"] = "mcp"
-        print("\n已选择: MCP 视觉工具模式")
-        print("  → AI Agent 使用当前环境的 MCP 视觉工具完成视频分析，零配置")
+        cfg["correct_mode"] = "auto"
+        print("\n已选择: 自动检测模式（openai > ollama > none）")
+        _prompt_api_config(cfg, prefix="openai_", default_url="https://api.openai.com/v1")
 
     xhs_video.save_config(cfg)
     print(f"[OK] 视频分析配置已保存 → data/video_config.json")
@@ -678,14 +649,12 @@ def cmd_setup_wizard(args) -> int:
     print("│  可用的分析能力：                                     │")
     print("│                                                       │")
     print("│  图片分析：                                          │")
-    print("│    Layer 1: OCR 文字提取（图片中的文字）             │")
-    print("│    Layer 2: AI 视觉描述（看懂路线图/穿搭/步骤）       │")
-    print("│    Layer 3: Mermaid 路线图/流程图                    │")
+    print("│    OCR 文字提取（图片中的文字）                      │")
     print("│                                                       │")
     print("│  视频分析：                                          │")
     print("│    Layer 1: 语音转文字（faster-whisper）             │")
     print("│    Layer 2: 关键帧 OCR（画面文字）                   │")
-    print("│    Layer 3: AI 摘要（none/local/ollama/openai）     │")
+    print("│    Layer 3: LLM 纠错（auto/ollama/openai/none）     │")
     print("└─────────────────────────────────────────────────────┘")
     print()
 
@@ -765,6 +734,5 @@ def cmd_setup_wizard(args) -> int:
     print("  python scripts/xhs.py crawl-search '关键词' --download --analyze  # 批量")
     print()
     print("单独调整配置：")
-    print("  python scripts/xhs.py setup-image   # 图片分析配置")
     print("  python scripts/xhs.py setup-video   # 视频分析配置")
     return 0

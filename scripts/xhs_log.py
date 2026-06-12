@@ -20,10 +20,12 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from xhs_config import LOG_PATH
@@ -43,7 +45,7 @@ def log_request(
     proxy: str | None = None,
     extra: dict[str, Any] | None = None,
 ) -> None:
-    rate_codes = {460, 461, 429, -100, -101, -109, -104}
+    rate_codes = {460, 461, 429, -100, -101, -102, -104, -105, -109, -110}
     record = {
         "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "api": api,
@@ -68,21 +70,24 @@ def log_request(
     except OSError as e:
         print(f"[LOG] 写日志失败：{e}", file=sys.stderr)
 
+    # 风控事件：本地日志已记录（run_single adapter 会同步到 Hub PG）
+    if record["was_rate_limited"]:
+        print(f"[RISK] code={code} api={api} account={account} msg={msg[:60]}", file=sys.stderr)
+
 
 _MAX_LOG_BYTES = 50 * 1024 * 1024  # 50 MB
 _MAX_LOG_FILES = 3
 
 
 def _rotate_if_needed(path: Path) -> None:
-    """日志轮转：超过 50MB 时重命名为 runs.YYYYMMDD_HHMMSS.jsonl，最多保留 3 个历史文件。"""
     try:
         if not path.exists() or path.stat().st_size < _MAX_LOG_BYTES:
             return
     except OSError:
         return
-    # 重命名当前日志
+    # 用进程 PID 避免多进程轮转冲突
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    rotated = path.with_name(f"runs.{ts}.jsonl")
+    rotated = path.with_name(f"runs.{ts}.{os.getpid()}.jsonl")
     try:
         path.rename(rotated)
     except OSError:
@@ -176,3 +181,43 @@ def print_stats(s: dict[str, Any]) -> None:
     print(f"  TOP 接口:")
     for api, n in s["by_api"].items():
         print(f"    {n:>5} × {api}")
+
+
+def recent_risk_score(minutes: int = 30) -> dict[str, Any]:
+    """读取最近 N 分钟的风控事件密度，用于实时风险评分。
+
+    返回: {"total": int, "risk": int, "density": float, "level": str}
+    - density = risk事件数 / 分钟数
+    - level: "safe" | "elevated" | "high" | "critical"
+    """
+    if not LOG_PATH.exists():
+        return {"total": 0, "risk": 0, "density": 0.0, "level": "safe"}
+    cutoff = time.time() - minutes * 60
+    total = 0
+    risk = 0
+    with open(LOG_PATH, encoding="utf-8") as f:
+        for line in f:
+            try:
+                r = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            try:
+                rt = datetime.fromisoformat(
+                    r["ts"].replace("Z", "+00:00")).timestamp()
+                if rt < cutoff:
+                    continue
+            except Exception:
+                continue
+            total += 1
+            if r.get("was_rate_limited"):
+                risk += 1
+    density = risk / minutes if minutes > 0 else 0
+    if density >= 0.5:
+        level = "critical"
+    elif density >= 0.2:
+        level = "high"
+    elif density >= 0.05:
+        level = "elevated"
+    else:
+        level = "safe"
+    return {"total": total, "risk": risk, "density": round(density, 3), "level": level}

@@ -35,18 +35,20 @@ class TestProxyPool:
         pool = ProxyPool(None)
         assert not pool.is_active()
 
-    def test_round_robin(self):
+    def test_random_selection(self):
+        """随机选择：多次调用应能覆盖所有可用代理。"""
         p1 = Proxy(url="http://h1:8080")
         p2 = Proxy(url="http://h2:8080")
         pool = ProxyPool.__new__(ProxyPool)
         pool.proxies = [p1, p2]
-        pool._idx = 0
 
-        first = pool.next_available()
-        assert first is not None
-        second = pool.next_available()
-        assert second is not None
-        assert first.url != second.url  # 轮询
+        # 多次调用，至少应返回两种不同的代理
+        urls = set()
+        for _ in range(20):
+            p = pool.next_available()
+            assert p is not None
+            urls.add(p.url)
+        assert len(urls) == 2  # 两个代理都应被选到
 
     def test_skip_cooldown(self):
         p1 = Proxy(url="http://h1:8080")

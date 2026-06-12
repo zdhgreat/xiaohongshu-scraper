@@ -211,20 +211,20 @@ def post_process_note(note: dict, conn: sqlite3.Connection, args) -> None:
             if video_local.exists():
                 cfg = xhs_video.load_config()
                 result = xhs_video.analyze_video(video_local, cfg)
-                ocr_text = " ".join(r["text"] for r in result.get("ocr_results", []))
+                ocr_text = json.dumps(result.get("ocr_results", []), ensure_ascii=False)
                 xhs_storage.update_video_analysis(
                     conn, note_id,
                     transcript=result.get("transcript", ""),
                     ocr_text=ocr_text,
-                    summary=result.get("summary", ""),
+                    summary="llm纠错" if result.get("corrected") else "",
                 )
                 updates = []
                 if result.get("transcript"):
                     updates.append(f"转录{len(result['transcript'])}字")
+                if result.get("corrected"):
+                    updates.append("已纠错")
                 if result.get("ocr_results"):
                     updates.append(f"OCR {len(result['ocr_results'])}帧")
-                if result.get("summary"):
-                    updates.append("摘要")
                 detail = "、".join(updates) if updates else "无新内容"
                 print(f"    [analyze] 《{title}》: {detail}", file=sys.stderr)
             else:
@@ -232,25 +232,18 @@ def post_process_note(note: dict, conn: sqlite3.Connection, args) -> None:
         except Exception as e:
             print(f"    [analyze] 《{title}》失败: {e}", file=sys.stderr)
     elif do_analyze and not is_video:
-        # 图文笔记 → 图片分析
+        # 图文笔记 → 图片 OCR
         try:
             import xhs_image
-            cfg = xhs_image.load_config()
-            result = xhs_image.analyze_images(note_id, conn, cfg)
+            result = xhs_image.analyze_images(note_id, conn)
             xhs_storage.update_image_analysis(
                 conn, note_id,
                 ocr_text=result.get("ocr_text", ""),
-                summary=result.get("image_summary", ""),
-                mermaid=result.get("mermaid", ""),
+                summary="",
+                mermaid="",
             )
-            updates = []
-            if result.get("ocr_text"):
-                updates.append(f"OCR {len(result['ocr_text'])} 字")
-            if result.get("image_summary"):
-                updates.append("AI 描述")
-            if result.get("mermaid"):
-                updates.append("路线图/流程图")
-            detail = "、".join(updates) if updates else "无新内容"
+            ocr_text = result.get("ocr_text", "")
+            detail = f"OCR {len(ocr_text)} 字" if ocr_text else "无 OCR 文字"
             print(f"    [analyze-image] 《{title}》: {detail}", file=sys.stderr)
         except Exception as e:
             print(f"    [analyze-image] 《{title}》失败: {e}", file=sys.stderr)

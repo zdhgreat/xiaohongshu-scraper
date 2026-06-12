@@ -1,3 +1,4 @@
+// xhs_main.js | source: xhs_main_260411.js | commit: d4a1fe7 | updated: 2026-06-11
 /**
  * 小红书X-S签名生成入口 - 4.3.2版本
  * 基于补环境实现

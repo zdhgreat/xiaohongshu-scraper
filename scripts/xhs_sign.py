@@ -4,8 +4,8 @@
 x-xray-traceid / x-rap-param。
 
 三档：
-  1. PlaywrightSigner — 真实浏览器跑 window._webmsxyw。免维护算法，最稳。
-  2. EmbedJsSigner    — py_mini_racer/execjs 跑 assets/xhs_main.js。快，但 JS 月度轮换需替换文件。
+  1. EmbedJsSigner    — py_mini_racer/execjs 跑 assets/xhs_main.js。快，且生成完整签名头，默认首选。
+  2. PlaywrightSigner — 真实浏览器跑 window._webmsxyw。免维护算法，最稳，但缺少 x-xray-traceid。
   3. PyPortSigner     — 纯 Python 端口。MVP 阶段仅占位，未实现。
 
 CLI 通过 --sign-mode 选择；默认 auto 按 fallback_chain 探针。
@@ -32,6 +32,7 @@ XHS_RAP_JS = ASSETS / "xhs_rap.js"
 XHS_XRAY_JS = ASSETS / "xhs_xray.js"
 CRYPTO_JS = ASSETS / "crypto-js.min.js"
 JS_VERSION_PATH = ROOT / "data" / "js_version.json"
+B1_CACHE_PATH = ROOT / "data" / "b1_cache.json"
 
 # 给 bare V8（py_mini_racer）一个最小 Node 兼容层：window / global / globalThis / require("crypto-js")
 # crypto-js.min.js 是 UMD，会把 CryptoJS 挂到 this 上；xhs_main.js 的"补环境"代码也依赖 global。
@@ -119,7 +120,8 @@ class SignerBase(ABC):
         self._recent: deque[bool] = deque(maxlen=20)
 
     @abstractmethod
-    def sign(self, api: str, data: Any, a1: str, method: str = "POST") -> dict[str, str]:
+    def sign(self, api: str, data: Any, a1: str, method: str = "POST",
+             platform: str = "") -> dict[str, str]:
         """返回 dict: x-s / x-t / x-s-common / x-b3-traceid / x-xray-traceid / x-rap-param"""
 
     def record(self, ok: bool) -> None:
@@ -218,14 +220,22 @@ class EmbedJsSigner(SignerBase):
         self._mtime_main: float = 0.0
         self._mtime_rap: float = 0.0
         self._mtime_xray: float = 0.0
+        self._cached_b1: str = ""
+        self._last_platform: str = ""  # 上次构建时的平台，用于按账号重建
+        self._try_load_b1_cache()
         self._reload_if_stale()
 
-    def _reload_if_stale(self) -> None:
+    def _reload_if_stale(self, platform: str = "") -> None:
+        # b1 注入后需强制重建（_mtime_main 已被置 0）
         m_main = XHS_MAIN_JS.stat().st_mtime
-        if m_main != self._mtime_main:
-            self._ctx_main = self._build_ctx(XHS_MAIN_JS)
+        platform_changed = platform and platform != self._last_platform
+        if m_main != self._mtime_main or platform_changed:
+            self._ctx_main = self._build_ctx(XHS_MAIN_JS, platform=platform)
             self._mtime_main = m_main
-            print(f"[SIGN] loaded {XHS_MAIN_JS.name} via {self._engine}", file=sys.stderr)
+            self._last_platform = platform
+            print(f"[SIGN] loaded {XHS_MAIN_JS.name} via {self._engine}"
+                  f"{' (platform=' + platform + ')' if platform else ''}",
+                  file=sys.stderr)
         if XHS_RAP_JS.exists():
             m_rap = XHS_RAP_JS.stat().st_mtime
             if m_rap != self._mtime_rap:
@@ -237,9 +247,33 @@ class EmbedJsSigner(SignerBase):
                 self._ctx_xray = self._build_ctx(XHS_XRAY_JS)
                 self._mtime_xray = m_xray
 
-    def _build_ctx(self, js_path: Path) -> "_JsCtx":
-        """组装：execjs 路径下把 require('crypto-js') 替换成绝对路径，让 Node 子进程能找到；mini-racer 路径下尝试拼 node-shim + crypto-js（多数 JS 跑不动，仅作降级尝试）。"""
+    def _build_ctx(self, js_path: Path, platform: str = "") -> "_JsCtx":
+        """组装 JS 签名上下文，注入 b1 和平台相关信息。"""
+        import re as _re
         source = js_path.read_text(encoding="utf-8")
+        # 注入 b1 令牌（替换 xhs_main.js 中硬编码的 fff）
+        if self._cached_b1:
+            source = _re.sub(r'var\s+fff\s*=\s*"[^"]*"',
+                             f'var fff = "{self._cached_b1}"',
+                             source, count=1)
+        # 注入平台信息：x2 字段、Navigator UA OS 片段、Edge 后缀
+        if platform and "x2:" in source:
+            # 1) x2: "Windows" → x2: "{platform}"（两处：seccore_signv2 + XsCommon）
+            source = _re.sub(r'x2:\s*"Windows"', f'x2: "{platform}"', source)
+            # 2) Navigator UA OS 片段
+            if platform == "macOS":
+                source = _re.sub(
+                    r'\(Windows NT \d+\.\d+; Win64; x64\)',
+                    '(Macintosh; Intel Mac OS X 10_15_7)', source)
+            elif platform == "Windows":
+                # 确保是 Windows 格式（防止上次是 Mac 后残留）
+                source = _re.sub(
+                    r'\(Macintosh; Intel Mac OS X \d+_\d+_\d+\)',
+                    '(Windows NT 10.0; Win64; x64)', source)
+            # 3) 非 Edge 指纹移除 Edg 后缀（Edge 浏览器标识不应出现在 Chrome 指纹中）
+            #    如果 UA 中有 Edg/ 但指纹不是 Edge 类型，移除它
+            #    这里简单处理：如果 platform 为空（默认不区分 Edge），保持原样
+            #    Edge 移除逻辑由 fetcher 根据 fingerprint.is_edge 控制
         if self._engine == "execjs":
             # 把 require("crypto-js") 改成项目内绝对路径，避免依赖子进程 cwd
             crypto_node = ASSETS / "node_modules" / "crypto-js"
@@ -247,7 +281,16 @@ class EmbedJsSigner(SignerBase):
                 abs_path = str(crypto_node).replace("\\", "/")
                 source = source.replace('require("crypto-js")', f'require("{abs_path}")')
                 source = source.replace("require('crypto-js')", f"require('{abs_path}')")
-            return _JsCtx(source, self._engine)
+            # xhs_xray.js 的 require('./xhs_xray_packN.js') 是相对于临时脚本文件，
+            # execjs 把 source 写到临时目录执行，相对路径无法解析 → 重写为绝对路径
+            assets_abs = str(ASSETS).replace("\\", "/")
+            for pack in ("xhs_xray_pack1.js", "xhs_xray_pack2.js"):
+                pack_abs = f"{assets_abs}/{pack}"
+                source = source.replace(f"require('./{pack}')", f"require('{pack_abs}')")
+                source = source.replace(f'require("./{pack}")', f'require("{pack_abs}")')
+                source = source.replace(f"require('../static/{pack}')", f"require('{pack_abs}')")
+                source = source.replace(f"require('./static/{pack}')", f"require('{pack_abs}')")
+            return _JsCtx(source, self._engine, cwd=ASSETS)
         # mini-racer：勉强尝试，多数情况会失败
         parts: list[str] = [_NODE_SHIM]
         if CRYPTO_JS.exists():
@@ -255,8 +298,43 @@ class EmbedJsSigner(SignerBase):
         parts.append(source)
         return _JsCtx("\n;\n".join(parts), self._engine)
 
-    def sign(self, api: str, data: Any, a1: str, method: str = "POST") -> dict[str, str]:
+    def _try_load_b1_cache(self) -> None:
+        """从 b1_cache.json 加载缓存的 b1。超过 24 小时的缓存自动失效。"""
+        if not B1_CACHE_PATH.exists():
+            return
+        try:
+            cache = json.loads(B1_CACHE_PATH.read_text(encoding="utf-8"))
+            b1 = cache.get("b1", "")
+            updated_at = cache.get("updated_at", 0)
+            if b1:
+                age = time.time() - updated_at
+                if age > 86400:  # 24 小时过期
+                    print(f"[SIGN] 缓存 b1 已过期（{int(age / 3600)}h 前），跳过",
+                          file=sys.stderr)
+                    return
+                self._cached_b1 = b1
+                print(f"[SIGN] 加载缓存 b1: {b1[:16]}...", file=sys.stderr)
+        except Exception:
+            pass
+
+    def inject_b1(self, b1: str | None = None, force: bool = False) -> bool:
+        """注入 b1 到 JS 签名上下文。返回是否注入了新值。"""
+        if b1 is None:
+            self._try_load_b1_cache()
+            b1 = self._cached_b1
+        if not b1:
+            return False
+        if b1 == self._cached_b1 and not force:
+            return False
+        print(f"[SIGN] 注入新 b1: {b1[:16]}...", file=sys.stderr)
+        self._cached_b1 = b1
+        self._mtime_main = 0  # 强制重建上下文
         self._reload_if_stale()
+        return True
+
+    def sign(self, api: str, data: Any, a1: str, method: str = "POST",
+             platform: str = "") -> dict[str, str]:
+        self._reload_if_stale(platform=platform)
         if self._ctx_main is None:
             raise SignError("EmbedJsSigner 上下文未初始化")
         data_str = "" if not data else (data if isinstance(data, str) else json.dumps(data, separators=(",", ":"), ensure_ascii=False))
@@ -277,15 +355,16 @@ class EmbedJsSigner(SignerBase):
         if self._ctx_xray:
             try:
                 headers["x-xray-traceid"] = self._ctx_xray.call("traceId")
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[SIGN] x-xray-traceid 生成失败（缺 pack 文件?）: {str(e)[:80]}",
+                      file=sys.stderr)
         if self._ctx_rap:
             try:
                 headers["x-rap-param"] = self._ctx_rap.call(
                     "generate_x_rap_param", api, data_str, None
                 )
             except Exception:
-                pass
+                pass  # x-rap-param 非必需，XHS API 不需要此头也能正常返回
         return headers
 
 
@@ -308,27 +387,66 @@ class PlaywrightSigner(SignerBase):
         self._pw = None
         self._browser = None
         self._page = None
+        self._browser_start_time: float = 0.0
+        self._browser_max_age: float = 7200  # 2 小时刷新一次
+        self._sign_count: int = 0
 
     def _ensure_browser(self) -> None:
         if self._page is not None:
-            return
+            try:
+                self._page.evaluate("1+1")
+                age = time.time() - self._browser_start_time
+                if age > self._browser_max_age:
+                    print(f"[SIGN] 浏览器会话已运行 {age/3600:.1f}h，主动刷新", file=sys.stderr)
+                    self.close()
+                else:
+                    return
+            except Exception:
+                print("[SIGN] 浏览器心跳失败，重启...", file=sys.stderr)
+                self.close()
         try:
             from playwright.sync_api import sync_playwright  # type: ignore
         except ImportError as e:
             raise SignError("需要 playwright。pip install playwright && playwright install chromium") from e
         self.persist_dir.mkdir(parents=True, exist_ok=True)
-        self._pw = sync_playwright().start()
-        self._browser = self._pw.chromium.launch_persistent_context(
-            user_data_dir=str(self.persist_dir),
-            headless=self.headless,
-            args=["--disable-blink-features=AutomationControlled"],
-        )
-        self._page = self._browser.new_page()
-        self._page.goto("https://www.xiaohongshu.com/", wait_until="domcontentloaded")
-        # 等 _webmsxyw 注入完成
-        self._page.wait_for_function("typeof window._webmsxyw === 'function'", timeout=15000)
+        try:
+            self._pw = sync_playwright().start()
+            self._browser = self._pw.chromium.launch_persistent_context(
+                user_data_dir=str(self.persist_dir),
+                headless=self.headless,
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+            self._page = self._browser.new_page()
+            # 注入 stealth 脚本隐藏 Playwright 自动化特征
+            self._page.add_init_script("""
+// 隐藏 navigator.webdriver（Playwright/自动化标记）
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+// 补全 window.chrome（headless Chromium 缺失该对象）
+if (!window.chrome) window.chrome = {runtime: {}, csi: function(){}, loadTimes: function(){}};
+// 补全权限查询（避免 notifications 权限查询暴露自动化）
+const _origQuery = window.navigator.permissions.query;
+window.navigator.permissions.query = (parameters) => (
+    parameters.name === 'notifications' ?
+    Promise.resolve({state: Notification.permission}) :
+    _origQuery(parameters)
+);
+""")
+            try:
+                from playwright_stealth import stealth_sync  # type: ignore
+                stealth_sync(self._page)
+            except ImportError:
+                pass
+            self._page.goto("https://www.xiaohongshu.com/", wait_until="domcontentloaded")
+            # 等 _webmsxyw 注入完成
+            self._page.wait_for_function("typeof window._webmsxyw === 'function'", timeout=15000)
+            self._browser_start_time = time.time()
+        except Exception as e:
+            print(f"[SIGN] 浏览器初始化失败: {e}，清理资源...", file=sys.stderr)
+            self.close()
+            raise SignError(f"PlaywrightSigner 浏览器初始化失败: {e}") from e
 
-    def sign(self, api: str, data: Any, a1: str, method: str = "POST") -> dict[str, str]:
+    def sign(self, api: str, data: Any, a1: str, method: str = "POST",
+             platform: str = "") -> dict[str, str]:
         self._ensure_browser()
         if self._page is None:
             raise SignError("PlaywrightSigner 页面未初始化")
@@ -342,12 +460,92 @@ class PlaywrightSigner(SignerBase):
             )
         except Exception as e:
             raise SignError(f"playwright sign failed: {e}") from e
+        # 每 20 次签名收割 b1
+        self._sign_count += 1
+        if self._sign_count % 20 == 0:
+            self._harvest_b1()
+        # 生成 x-xray-traceid：优先用浏览器 crypto API，失败则降级到 Python random
+        xray_traceid = ""
+        try:
+            xray_traceid = self._page.evaluate(
+                "() => { try { return crypto.randomUUID().replace(/-/g, ''); } catch(e) { return ''; } }"
+            )
+        except Exception:
+            pass
+        if not xray_traceid:
+            xray_traceid = random_b3_traceid(32)
         return {
             "x-s": ret.get("X-s") or ret.get("x-s") or "",
             "x-t": str(ret.get("X-t") or ret.get("x-t") or ts),
             "x-s-common": ret.get("x-s-common", ""),
             "x-b3-traceid": random_b3_traceid(),
+            "x-xray-traceid": xray_traceid,
         }
+
+    def _harvest_b1(self) -> None:
+        """从浏览器 localStorage 收割 b1 令牌并缓存（原子写入）。"""
+        try:
+            b1 = self._page.evaluate('localStorage.getItem("b1")') or ""
+            if b1:
+                B1_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+                data = json.dumps({"b1": b1, "updated_at": time.time()}, ensure_ascii=False)
+                tmp = B1_CACHE_PATH.with_suffix('.tmp')
+                tmp.write_text(data, encoding="utf-8")
+                tmp.replace(B1_CACHE_PATH)
+                print(f"[SIGN] 收割 b1: {b1[:16]}...（每 20 次签名）", file=sys.stderr)
+        except Exception as e:
+            print(f"[SIGN] b1 收割失败: {e}", file=sys.stderr)
+
+    def get_b1(self) -> str:
+        """获取浏览器最新的 b1 值。"""
+        try:
+            if self._page:
+                return self._page.evaluate('localStorage.getItem("b1")') or ""
+        except Exception:
+            pass
+        return ""
+
+    def fetch_api(self, method: str, api: str, params: dict | None = None,
+                  data: dict | None = None) -> dict:
+        """用真实浏览器发起 API 请求（绕过所有签名生成问题）。
+
+        真实浏览器的 XHS SDK 会自动附加全部签名头（x-s / x-t / x-s-common /
+        x-xray-traceid / x-rap-param），无需本地生成签名。用于 embed-js 签名头
+        不完整导致 406 时的兜底。
+        """
+        import xhs_config
+        self._ensure_browser()
+        if self._page is None:
+            raise SignError("PlaywrightSigner 页面未初始化")
+        full_api = api
+        if params:
+            from urllib.parse import urlencode
+            qs = urlencode(params)
+            full_api = f"{api}?{qs}" if "?" not in api else f"{api}&{qs}"
+        url = xhs_config.BASE + full_api
+        body_str = "" if not data else json.dumps(data, separators=(",", ":"), ensure_ascii=False)
+        js = """
+        async ([method, url, body]) => {
+            const opts = {method: method, credentials: 'include'};
+            if (method === 'POST' && body) {
+                opts.headers = {'content-type': 'application/json;charset=UTF-8'};
+                opts.body = body;
+            }
+            try {
+                const r = await fetch(url, opts);
+                const t = await r.text();
+                try { return {ok: true, status: r.status, json: JSON.parse(t)}; }
+                catch (e) { return {ok: false, status: r.status, text: t.slice(0, 400)}; }
+            } catch (e) { return {ok: false, error: String(e)}; }
+        }
+        """
+        try:
+            ret = self._page.evaluate(js, [method, url, body_str])
+        except Exception as e:
+            raise SignError(f"playwright fetch failed: {e}") from e
+        if not ret or not ret.get("ok"):
+            raise SignError(f"playwright fetch 返回异常: {ret}")
+        return ret.get("json") or {}
 
     def close(self) -> None:
         try:
@@ -375,7 +573,8 @@ class PyPortSigner(SignerBase):
 
     name = "py-port"
 
-    def sign(self, api: str, data: Any, a1: str, method: str = "POST") -> dict[str, str]:
+    def sign(self, api: str, data: Any, a1: str, method: str = "POST",
+             platform: str = "") -> dict[str, str]:
         raise SignError(
             "PyPortSigner 是 auto 降级链的终点，有意不实现。"
             "请用 --sign-mode embed-js 或 playwright"
@@ -458,12 +657,49 @@ class AutoSigner(SignerBase):
             except SignError:
                 pass  # 首选仍然不可用，保持当前档位
 
-    def sign(self, api: str, data: Any, a1: str, method: str = "POST") -> dict[str, str]:
+    _last_b1_standalone_refresh: float = 0.0  # 上次独立 b1 刷新时间戳（类级变量）
+
+    def _sync_b1(self) -> None:
+        """定期从 b1_cache.json 同步到 EmbedJsSigner。"""
+        if self._sign_count % 100 != 0:
+            return
+        emb = self._instances.get("embed-js")
+        if isinstance(emb, EmbedJsSigner):
+            emb.inject_b1()
+        # 如果 PlaywrightSigner 已在运行（作为降级签名器），顺便收割
+        pw = self._instances.get("playwright")
+        if isinstance(pw, PlaywrightSigner) and pw._page is not None:
+            try:
+                pw._harvest_b1()
+                b1 = pw.get_b1()
+                if b1 and isinstance(emb, EmbedJsSigner):
+                    emb.inject_b1(b1)
+            except Exception:
+                pass
+        # PlaywrightSigner 不可用时，定期用 headless 浏览器刷新 b1（防止缓存过期 >2h）
+        if not (isinstance(pw, PlaywrightSigner) and pw._page is not None):
+            _now = time.time()
+            _cache_age = _now - (B1_CACHE_PATH.stat().st_mtime if B1_CACHE_PATH.exists() else 0)
+            _since_last = _now - AutoSigner._last_b1_standalone_refresh
+            if _cache_age > 7200 and _since_last > 3600:  # 缓存 >2h 且距上次刷新 >1h
+                AutoSigner._last_b1_standalone_refresh = _now
+                print("[SIGN] b1 缓存过期，启动 headless 浏览器刷新...", file=sys.stderr)
+                try:
+                    new_b1 = extract_b1_standalone()
+                    if new_b1 and isinstance(emb, EmbedJsSigner):
+                        emb.inject_b1(new_b1, force=True)
+                        print(f"[SIGN] b1 独立刷新成功: {new_b1[:16]}...", file=sys.stderr)
+                except Exception as e:
+                    print(f"[SIGN] b1 独立刷新失败: {e}", file=sys.stderr)
+
+    def sign(self, api: str, data: Any, a1: str, method: str = "POST",
+             platform: str = "") -> dict[str, str]:
         self._sign_count += 1
         self._try_recover()
+        self._sync_b1()
         signer = self._active()
         try:
-            headers = signer.sign(api, data, a1, method)
+            headers = signer.sign(api, data, a1, method, platform=platform)
             signer.record(True)
             self.record(True)
             return headers
@@ -476,7 +712,7 @@ class AutoSigner(SignerBase):
                 if self._active_idx < len(self.chain):
                     new = self.chain[self._active_idx]
                     print(f"[SIGN-DEGRADE] {old} → {new}", file=sys.stderr)
-                    return self.sign(api, data, a1, method)
+                    return self.sign(api, data, a1, method, platform=platform)
             raise
 
 
@@ -486,6 +722,51 @@ def make_signer(mode: str = "auto") -> SignerBase:
     if mode not in _REGISTRY:
         raise SignError(f"未知 sign-mode: {mode}；可选 {list(_REGISTRY.keys())} 或 auto")
     return _REGISTRY[mode]()
+
+
+def extract_b1_standalone() -> str | None:
+    """启动临时浏览器提取 b1 令牌。用于 Fetcher 遇到 -104 时紧急刷新。"""
+    try:
+        from playwright.sync_api import sync_playwright  # type: ignore
+    except ImportError:
+        return None
+    pw = None
+    browser = None
+    try:
+        pw = sync_playwright().start()
+        profile = ROOT / "data" / "pw_profile_b1"
+        profile.mkdir(parents=True, exist_ok=True)
+        browser = pw.chromium.launch_persistent_context(
+            user_data_dir=str(profile),
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        page = browser.new_page()
+        page.goto("https://www.xiaohongshu.com/", wait_until="domcontentloaded")
+        page.wait_for_function("typeof window._webmsxyw === 'function'", timeout=15000)
+        b1 = page.evaluate('localStorage.getItem("b1")') or ""
+        if b1:
+            B1_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = B1_CACHE_PATH.with_suffix('.tmp')
+            tmp.write_text(
+                json.dumps({"b1": b1, "updated_at": time.time()}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            tmp.replace(B1_CACHE_PATH)
+            print(f"[SIGN] 独立收割 b1: {b1[:16]}...", file=sys.stderr)
+            return b1
+        return None
+    except Exception as e:
+        print(f"[SIGN] 独立 b1 收割失败: {e}", file=sys.stderr)
+        return None
+    finally:
+        try:
+            if browser:
+                browser.close()
+            if pw:
+                pw.stop()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------

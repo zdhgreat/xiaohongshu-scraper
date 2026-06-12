@@ -1,7 +1,7 @@
 ---
 name: xiaohongshu-scraper
-description: 抓取小红书（RedNote/Little Red Book/XHS）笔记、用户主页、关键词搜索结果，落库 SQLite 并导出 Markdown / CSV（飞书多维表格格式）。在用户提到"爬小红书"、"采集小红书笔记"、"抓 xhs"、"分析小红书数据"、"导出小红书到飞书"、"备份我喜欢的小红书博主"、"收集某关键词下的小红书内容"等场景时调用。三档签名（playwright/embed-js/py-port）+ 跨平台登录（rookiepy/原生浏览器提取/QR/手动）+ 浏览器接管 的纵深防御架构，应对小红书强反爬。
-version: "1.6.0"
+description: 抓取小红书（RedNote/Little Red Book/XHS）笔记、用户主页、关键词搜索结果，落库 SQLite + Postgres 双写并导出 Markdown / CSV（飞书多维表格格式）。五层纵深防御架构（签名稳定 + 传输稳定 + 会话稳定 + 账号稳定 + 可观测性），应对小红书"阿瑞斯"风控体系。**搜索默认走真实浏览器 DOM 模式**（降低 API 指纹暴露），用户主页/笔记详情仍走 API（签名保护）。支持 b1 令牌收割注入、会话间歇休息、请求多样性、账号时间窗口主动轮换。对接 financial_hub_postgres / financial_hub 爬虫生命周期管理，跨平台浏览器适配（Windows/macOS/WSL）。
+version: "3.0.0"
 author: zhudonghai
 type: skill
 tags:
@@ -90,8 +90,7 @@ python scripts/xhs.py setup
 # 推荐：统一引导向导，一次性配置图片+视频
 python scripts/xhs.py setup-wizard
 
-# 或单独配置
-python scripts/xhs.py setup-image   # 图片分析
+# 单独配置视频分析
 python scripts/xhs.py setup-video   # 视频分析
 ```
 
@@ -126,6 +125,7 @@ python scripts/xhs.py sign-test
 
 判断输出：
 - 至少 `[embed-js] OK` 或 `[playwright] OK` 其一 → 继续
+- `[py-port]` 永远 FAIL（有意未实现，是降级链终点）
 - 两者都 FAIL → **JS 已过期**，转到「签名 JS 月度更新」节，不要继续抓
 - 抓取过程中持续出现 460 → 同上
 
@@ -141,59 +141,80 @@ python scripts/xhs.py login --prefer manual    # 让用户从 DevTools 粘贴 co
 python scripts/xhs.py login --name <alias>     # 多账号：保存到 data/accounts/<alias>.json
 ```
 
-`--prefer` 完整选项：`auto`（自动选择最优）、`rookie`（rookiepy 跨平台提取）、`edge`/`chrome`（原生浏览器提取，跨平台）、`native`（Edge + Chrome 依次尝试）、`qr`（扫码）、`manual`（手动粘贴）、`wsl-*`（WSL 环境专用）。
+`--prefer` 完整选项：
+- `auto`（自动选择最优）
+- `rookie`（rookiepy 跨平台提取）
+- `edge`/`chrome`/`firefox`/`brave`（从对应浏览器提取 cookie）
+- `native`/`native-edge`/`native-chrome`/`native-firefox`/`native-brave`（原生浏览器提取）
+- `qr`（扫码）
+- `manual`（手动粘贴）
+- `wsl-edge`/`wsl-edge-cdp`/`wsl-chrome`/`wsl-chrome-cdp`（WSL 环境专用）
 
 `data/cookies.json` 存在且包含 `web_session` 和 `a1` 即视为登录有效。Cookie 有效期约 30 天。
 
 ### 多账号授权
 
-> 多号爬取能显著提升日抓上限（每个号 500/天，3 个号 = 1500/天），且 460/461 风控时自动切换。
+> 多号爬取能显著提升日抓上限（每个号 API 80/天 + DOM 搜索 100 页/天），且 460/461 风控时自动切换。
 
-**推荐方式一：浏览器提取（跨平台，最稳定）**
+#### 方式一：QR 扫码（推荐，最简单）
 
-先用真实浏览器（Chrome / Edge / Firefox）登录 xiaohongshu.com，然后提取 cookie：
-
-```bash
-# 自动模式：rookiepy 直接读取浏览器 cookie（无需关闭浏览器）
-python scripts/xhs.py login --name account1
-# → 换浏览器账号或用无痕窗口登录另一个号
-python scripts/xhs.py login --name account2
-
-# 指定浏览器
-python scripts/xhs.py login --prefer edge --name edge_account     # 从 Edge 提取
-python scripts/xhs.py login --prefer chrome --name chrome_account # 从 Chrome 提取
-```
-
-**推荐方式二：扫码登录**
+不需要提前在浏览器登录任何账号，直接用手机扫码：
 
 ```bash
-# 每个号扫一次码即可，不需要切换浏览器
+# 第一个号
 python scripts/xhs.py login --prefer qr --name account1
-# → 弹出 Chromium → 用手机 A 扫码确认
+# → 弹出浏览器窗口 → 打开手机小红书 App → 扫码 → 确认登录
+# → 自动保存到 data/accounts/account1.json
 
+# 第二个号
 python scripts/xhs.py login --prefer qr --name account2
-# → 弹出新的 Chromium（独立 profile）→ 用手机 B 扫码确认
+# → 再弹窗口 → 用另一个手机号的小红书 App 扫码
+# → 保存到 data/accounts/account2.json
 
 # 同一部手机也可以：在小红书 App 里切换账号后扫第二个码
 ```
 
-每个 `--name` 会用独立的浏览器 profile（`data/pw_profile_<name>`），不会互相干扰。
+每个 `--name` 用独立的浏览器 profile（`data/pw_profile_<name>`），互不干扰。
 
-**注意**：Playwright 内置 Chromium 的扫码登录 session 可能不稳定（小红书反爬检测），建议优先使用浏览器提取方式。
+#### 方式二：从已登录的浏览器提取（适合已有登录态）
 
-**方式三：多浏览器提取（跨平台）**
+如果你已经在浏览器（Edge/Chrome/Firefox）登录了小红书，可以直接提取 cookie（无需关闭浏览器）：
 
-如果 Edge 和 Chrome 分别登录了不同的小红书账号：
-
+**单账号**：
 ```bash
-python scripts/xhs.py login --prefer edge --name edge_account
-python scripts/xhs.py login --prefer chrome --name chrome_account
+python scripts/xhs.py login              # 自动从浏览器提取，保存到 data/cookies.json
 ```
 
-**方式三：手动粘贴（通用）**
+**多账号**（需要在浏览器中切换登录）：
+```bash
+# 1. 在 Edge 中登录小红书账号 A
+python scripts/xhs.py login --name account1
+# → rookiepy 秒级提取 cookie，保存完毕
 
-适合任何环境，不需要额外依赖：
+# 2. 在 Edge 中退出账号 A，登录账号 B（或用无痕窗口登录 B）
+python scripts/xhs.py login --name account2
+# → 提取账号 B 的 cookie
+```
 
+> **关于浏览器 Profile**：Edge/Chrome 支持创建多个 Profile（独立登录态），但 rookiepy 默认只读默认 Profile 的 cookie。所以多账号最简单的做法是：**同一个 Profile 里换号登录，每次登录后运行一次 `login` 命令**。或者直接用 QR 扫码，完全不需要关心浏览器。
+
+**指定浏览器提取**：
+```bash
+python scripts/xhs.py login --prefer edge --name edge_account     # 从 Edge 提取
+python scripts/xhs.py login --prefer chrome --name chrome_account # 从 Chrome 提取
+```
+
+#### 方式三：两个不同浏览器各登录一个号
+
+如果 Edge 登录了账号 A，Chrome 登录了账号 B：
+```bash
+python scripts/xhs.py login --prefer edge --name account1
+python scripts/xhs.py login --prefer chrome --name account2
+```
+
+#### 方式四：手动粘贴（任何环境都可用）
+
+不需要任何依赖，适合服务器等无 GUI 环境：
 ```bash
 python scripts/xhs.py login --prefer manual --name account1
 # → 提示粘贴 cookie → 在浏览器登录小红书 → F12 → Application → Cookies → 复制全部
@@ -202,13 +223,13 @@ python scripts/xhs.py login --prefer manual --name account2
 # → 切换浏览器账号或用无痕窗口 → 重复上述步骤
 ```
 
-**添加完账号后验证**：
+#### 验证账号
 
 ```bash
 python scripts/xhs.py accounts
 # 输出:
-#   [account1       ] 日抓   0/500  累计     0  460×0  461×0
-#   [account2       ] 日抓   0/500  累计     0  460×0  461×0
+#   [account1       ] 日抓   0/80  累计     0  460×0  461×0
+#   [account2       ] 日抓   0/80  累计     0  460×0  461×0
 ```
 
 **自动轮换行为**：运行任何爬取命令时，系统自动选择最久未用的可用账号。触发 460/461 风控时自动冷却当前号并切换到下一个。不需要手动指定账号。
@@ -217,16 +238,25 @@ python scripts/xhs.py accounts
 
 | 用户意图 | 命令 | 说明 |
 |---|---|---|
-| 抓单条笔记 | `python scripts/xhs.py note <note_id> [--xsec-token <token>]` | 部分笔记需 xsec_token（从分享链接 URL 参数取）；DB 里有时自动复用 |
+| 抓单条笔记 | `python scripts/xhs.py note <note_id> [--xsec-token <token>]` | 缺 xsec_token 时自动搜索降级获取；DB 里有 token 时自动复用；获取不到则拒绝执行避免 461 |
 | 抓某用户笔记列表 | `python scripts/xhs.py user <user_id> --pages 3 --download --analyze` | 前 N 页，每页 30 条；加 `--download --analyze` 自动下载+分析 |
 | 抓关键词搜索 | `python scripts/xhs.py search "<关键词>" --pages 2 --download --analyze` | 前 N 页，每页 20 条；加 `--download --analyze` 自动下载+分析 |
+
+> **搜索模式说明**：搜索默认使用真实浏览器 DOM 模式，通过浏览器渲染页面提取搜索结果，避免 API 指纹暴露。用户主页和笔记详情仍通过 API 获取（受签名保护），不走 DOM。
+> 
+> 可通过环境变量控制搜索行为：
+> - `XHS_SEARCH_MODE=dom`（默认）— 浏览器 DOM 搜索；`=api` 切换为 API 搜索（需签名，小时配额限制）
+> - `XHS_SEARCH_HOURLY_QUOTA=3`（默认）— API 搜索模式的小时配额上限
+> - 也可在 `data/config.json` 中设置 `search_mode` 键
+| 补全半成品笔记 | `python scripts/xhs.py enrich --limit 50` | 搜索入库但无标题/详情的笔记，逐条调详情 API 补全（需要 xsec_token） |
 | 抓某笔记评论 | `python scripts/xhs.py comments <note_id> --max-pages 5 --max-sub-pages 3 [--no-sub]` | 含子评论分页；`--no-sub` 跳过子评论分页 |
 | 下载某笔记图片/视频 | `python scripts/xhs.py download <note_id> [--no-video] [--overwrite]` | `--no-video` 不下载视频；`--overwrite` 重新下载已有文件 |
 | 推荐流/分类流 | `python scripts/xhs.py feed --category <cat> --pages 2 [--num 18]` | 分类见下方；`--num` 每页条数 |
 | **长任务** 关键词 + 断点续抓 | `python scripts/xhs.py crawl-search "<kw>" --max-pages 20 [--resume]` | 风控/中断后 `--resume` 接续 |
 | **长任务** 用户全部笔记 | `python scripts/xhs.py crawl-user <user_id> --max-pages 50 [--resume]` | 同上 |
-| 视频内容智能分析 | `python scripts/xhs.py analyze-video <note_id>` | 语音转文字 + 关键帧 OCR + AI 摘要 |
-| 配置视频分析 | `python scripts/xhs.py setup-video` | 交互选择 AI 摘要模式、Whisper 模型等 |
+| 视频内容智能分析 | `python scripts/xhs.py analyze-video <note_id>` | 语音转文字 + 关键帧 OCR（转录需 Agent 纠错，见 `correct` 命令） |
+| Agent 转录纠错 | `python scripts/xhs.py correct --list` | 列出待纠错视频笔记；`--note <id> --apply "<文本>"` 写回纠错后转录 |
+| 配置视频分析 | `python scripts/xhs.py setup-video` | 交互配置 Whisper 模型、帧间隔、可选 LLM 纠错后端 |
 
 > **单篇笔记完整处理**：抓取单条笔记时，必须依次执行 note → download → comments → analyze-images/analyze-video → export。详见「单篇笔记完整处理流程（强制标准）」节。
 
@@ -236,7 +266,7 @@ python scripts/xhs.py accounts
 
 ```
 --sign-mode {auto, embed-js, playwright, py-port}   # 默认 auto，自动选最优并降级
---speed-mode {normal, slow, paranoid}               # 默认 normal（3-7s/请求）
+--speed-mode {paranoid}                              # 当前仅 paranoid（每请求 4-10 分钟，最安全）
 --proxy http://host:port                            # 走代理
 --account <alias>                                   # 多账号时指定账号别名
 ```
@@ -248,7 +278,7 @@ python scripts/xhs.py accounts
 | 笔记类型 | 必须执行的分析命令 | 说明 |
 |---|---|---|
 | 图文笔记 | `analyze-images` | OCR 文字提取 + AI 视觉描述 |
-| 视频笔记 | `analyze-video` | 语音转文字 + 关键帧 OCR + AI 摘要 |
+| 视频笔记 | `analyze-video` + **`correct`** | 语音转文字 + 关键帧 OCR，转录用 `correct` 子命令纠错 |
 
 ```bash
 # 图文笔记
@@ -285,6 +315,20 @@ python scripts/xhs.py export --format xlsx                   # 全量 XLSX（多
 
 输出位置：`data/output/`（Markdown 按博主分子目录，CSV 按博主分文件）
 
+### 自动机制（无需手动操作）
+
+以下机制在抓取流程中自动执行，无需用户干预：
+
+**自动 PG 同步**：数据写入类命令（note/user/search/crawl-*/enrich 等）成功退出后，自动将 SQLite 数据同步到 PostgreSQL（`.env` 中 `POSTGRES_DB` 配置的库）。PG 不可用时静默跳过，不影响主流程。
+
+**纠错提醒**：视频笔记入库后，命令退出前自动检测待纠错转录并打印 `⚠️ [CORRECT] 待纠错 N 条`，提示用 `correct --list` / `correct --note <id> --apply` 处理。看到该提示即应执行纠错，否则转录含同音字错误不可用。
+
+**raw_json 保护**：同一条笔记被多次入库时（如先搜索后抓详情），系统自动保留更完整的 `raw_json`（按长度比较），防止搜索摘要覆盖详情数据。
+
+**461 重试上限**：遇到 461 验证码时最多重试 3 次（`_retry_depth >= 3`），超限直接终止并报错，避免无限循环。
+
+**xsec_token 自动获取**：`note` 命令在缺少 xsec_token 时，会自动通过搜索 API 查找该笔记获取 token；获取不到则拒绝执行（返回退出码 1），避免无 token 直接触发 461 风控。
+
 ### Step 6：逐条报告（重要原则）
 
 **禁止**："先把 100 条全部抓完，最后统一报告"。
@@ -305,13 +349,13 @@ python scripts/xhs.py export --format xlsx                   # 全量 XLSX（多
 | `comments <id> [--max-pages N] [--max-sub-pages N] [--no-sub]` | 评论树（含子评论分页，`--no-sub` 跳过子评论） | 是 |
 | `download <id> [--no-video] [--overwrite]` | 图片/视频本地化 | 否 |
 | `feed --category <cat> --pages N [--num N]` | 推荐流/分类流浏览入库 | 是 |
-| `crawl-search <kw> --max-pages N [--resume] [--no-analyze]` | 关键词断点续抓（默认下载+分析） | 是 |
-| `crawl-user <id> --max-pages N [--resume] [--no-analyze]` | 用户全部笔记断点续抓（默认下载+分析） | 是 |
-| `crawl-feed --category <cat> --max-pages N [--resume] [--no-analyze]` | 推荐流断点续抓（默认下载+分析） | 是 |
-| `analyze-video <id> [--mode <mode>] [--whisper-model <m>] [--frame-interval N] [--step extract transcribe ocr summary]` | 视频内容智能分析（**单条约 2-5 分钟，timeout 需 >=300s**；或改用 crawl 命令） | 否 |
-| `setup-video [--mode <mode>] [--whisper-model <m>] [--frame-interval N]` | 交互式配置视频分析 | 否 |
-| `analyze-images <id> [--mode <mode>] [--backend <b>] [--no-mermaid] [--step ocr vision mermaid]` | 图片内容智能分析（OCR+AI视觉+Mermaid图表）；`--step` 分段执行 | 否 |
-| `setup-image [--mode <mode>] [--backend <b>] [--no-mermaid]` | 交互式配置图片分析 | 否 |
+| `crawl-search <kw> --max-pages N [--resume] [--no-download] [--no-analyze]` | 关键词断点续抓（默认下载+分析） | 是 |
+| `crawl-user <id> --max-pages N [--resume] [--no-download] [--no-analyze]` | 用户全部笔记断点续抓（默认下载+分析） | 是 |
+| `crawl-feed --category <cat> --max-pages N [--resume] [--no-download] [--no-analyze]` | 推荐流断点续抓（默认下载+分析） | 是 |
+| `analyze-video <id> [--correct-mode <mode>] [--whisper-model <m>] [--frame-interval N] [--max-duration N] [--step extract transcribe ocr]` | 视频内容智能分析（转录+OCR；转录需随后用 `correct` 子命令纠错；单条约 2-5 分钟，timeout 需 >=300s；`--max-duration` 限制分析时长，默认 300s） | 否 |
+| `correct --list [--limit N]` / `--note <id>` / `--note <id> --apply "<文本>"` | Agent 手动纠错视频转录：列出/读取/写回（标记 `video_summary='agent纠错'`，OCR 原样保留） | 是 |
+| `setup-video [--correct-mode <mode>] [--whisper-model <m>] [--frame-interval N]` | 交互式配置视频分析 | 否 |
+| `analyze-images <id>` | 图片内容智能分析（OCR+AI视觉+Mermaid图表） | 否 |
 | `setup-wizard` | 统一引导向导：配置图片+视频分析（推荐首次运行） | 否 |
 | `export --format md --note <id>` | 单篇 MD（多文件目录：index.md + video.md + images.md + comments.md） | 否 |
 | `export --format csv [--user <id>]` | CSV（按博主分文件，`--user` 过滤指定博主） | 否 |
@@ -320,14 +364,16 @@ python scripts/xhs.py export --format xlsx                   # 全量 XLSX（多
 | `accounts` | 多账号状态查看 | 否 |
 | `stats [--hours N] [--account <alias>]` | 请求统计（`--account` 按账号过滤） | 否 |
 | `refresh-cookies [--force]` | 批量检查并刷新所有账号 cookie | 否 |
-| `keepalive [--daemon] [--force] [--account <alias>]` | Cookie 保活（单次或守护进程模式） | 否 |
-| `crawl-parallel --users uid1 uid2 ... [--max-pages N]` | 多账号并行爬取不同用户 | 是 |
-| `crawl-parallel --keywords kw1 kw2 ... [--max-pages N]` | 多账号并行搜索不同关键词 | 是 |
+| `keepalive [--daemon] [--force] [--account <alias>] [--interval N]` | Cookie 保活（单次或守护进程模式；`--interval` 秒，默认 7200） | 否 |
 | `update-js [--dry-run]` | 从 Spider_XHS 拉取最新签名 JS | 否 |
 | `analyze --type {sentiment\|topics} [--keyword <kw>] [--user <id>] [--note <id>] [--output json]` | 评论情感分析 / 话题聚类（`--output json` 输出 JSON） | 否 |
 | `health` | 系统健康检查（依赖+签名+账号+DB），返回码 0=健康 1=降级 2=严重 | 否 |
 | `refresh --max-age-hours N --limit N` | 重抓超过 N 小时的旧笔记（增量更新） | 是 |
-| `cleanup [--dry-run] [--vacuum]` | 数据清理：孤儿媒体、过期缓存、VACUUM 压缩 | 否 |
+| `enrich --limit N` | 补全搜索入库的半成品笔记（无标题/详情的笔记逐条调详情 API） | 是 |
+| `cleanup [--dry-run] [--max-cache-days N] [--max-state-days N] [--vacuum]` | 数据清理：孤儿媒体、过期缓存、VACUUM 压缩 | 否 |
+| `update-fp [--dry-run]` | 全量更新 UA/指纹池/TLS/签名 JS | 否 |
+| `run --keywords <kw> [--max-notes N] [--pages N]` | 按需执行模式：单次搜索+提取，用完即停（比 serve 更安全） | 是 |
+| `serve --targets <t1> <t2> [--interval N] [--max-pages N] [--proxy URL]` | 守护进程模式：自动循环爬取（`--interval` 小时，`--targets` 格式 `search:kw`/`user:uid`/`feed`） | 是 |
 
 ---
 
@@ -348,7 +394,7 @@ python scripts/xhs.py export --format md --note 6603abc123
 > **用户**："我想备份博主 5fa8xxx 的所有笔记，导成 csv 给飞书用"
 
 ```bash
-python scripts/xhs.py user 5fa8xxx --pages 50 --speed-mode slow --download --analyze
+python scripts/xhs.py user 5fa8xxx --pages 50 --speed-mode paranoid --download --analyze
 python scripts/xhs.py export --format csv --user 5fa8xxx
 ```
 
@@ -376,6 +422,13 @@ python scripts/xhs.py feed --category recommend --pages 2
 # feed 不支持 --analyze，需要对单条笔记执行分析
 # 或使用 crawl-feed --download --analyze 自动分析
 python scripts/xhs.py export --format csv
+```
+
+> **用户**："之前搜索入库的笔记标题都是空的，能补全吗？"
+
+```bash
+# 自动找到标题为空或数据不完整的笔记，逐条调详情 API 补全
+python scripts/xhs.py enrich --limit 50
 ```
 
 > **用户**："分析一下'露营'关键词下的评论情感"
@@ -409,7 +462,18 @@ python scripts/xhs.py refresh-cookies
 
 ## 视频内容智能分析
 
-小红书大量博主以视频形式发布内容，视频分析功能可对已入库的视频笔记做深度内容提取：
+小红书大量博主以视频形式发布内容，视频分析功能对已入库的视频笔记做深度内容提取：
+
+### 流程
+
+```
+1. extract     → ffmpeg 提取音频(wav) + 关键帧(frames/*.jpg)
+2. transcribe  → faster-whisper 语音转文字
+3. OCR         → rapidocr 逐帧画面文字识别
+4. Agent 纠错  → AI Agent 用 OCR 画面文字纠正 Whisper 转录中的同音字和英文错误
+```
+
+最终输出是**纠错后的转录文本**（而非原始 Whisper 输出）。Agent 纠错使用 OCR 画面文字作为参照，修正同音字（如"设训品→奢侈品"、"协率→斜率"、"老犯→老范"）和英文识别错误（如"Cloud→Claude"、"P2T→Peter Thiel"）。
 
 ### 依赖（未安装时自动降级为仅 OCR，但分析步骤必须执行）
 
@@ -426,20 +490,51 @@ python scripts/xhs.py refresh-cookies
 python scripts/xhs.py setup-video
 
 # 或直接指定参数
-python scripts/xhs.py setup-video --mode local --whisper-model base --frame-interval 5
+python scripts/xhs.py setup-video --whisper-model base --frame-interval 5
 ```
 
-配置文件：`data/video_config.json`
+配置文件：`data/video_config.json`（Whisper 模型、帧间隔等参数，纠错由 Agent 完成无需配置 API）
 
-### AI 摘要五档
+### Agent 转录纠错（必须执行）
 
-| 模式 | 说明 | 依赖 |
+Whisper 语音转文字存在大量同音字和英文识别错误，**所有视频笔记的转录都必须由 Agent 纠错后才能阅读**。不需要配置外部 API，直接由当前 Agent 完成。
+
+**纠错流程**：
+
+1. Python 完成 Whisper 转录 + OCR，写入 DB
+2. Agent 从 DB 读取转录 + OCR 参照文字
+3. Agent 纠正同音字、英文错误、专有名词错误
+4. Agent 将纠错后的转录写回 DB（`video_summary='agent纠错'`）
+
+**纠错命令**（封装为 `correct` 子命令，Agent 必须用命令、不得手拼 SQL）：
+
+```bash
+# 1. 列出待纠错视频笔记（每条含完整 transcript + OCR 参照）
+python scripts/xhs.py correct --list --limit 50
+
+# 2. 读单条（可选；--list 已含全文）
+python scripts/xhs.py correct --note <note_id>
+
+# 3. Agent 纠错后写回（video_transcript=纠错文本，标记 video_summary='agent纠错'；OCR 原样保留不被覆盖）
+python scripts/xhs.py correct --note <note_id> --apply "纠错后的完整转录文本"
+```
+
+`--list` 已输出每条的完整转录 + OCR，Agent 读后逐条纠错、用 `--apply` 写回。`--apply` 经 subprocess 传参，长文本/特殊字符安全。
+
+**典型纠错对照表**：
+
+| Whisper 错误 | 正确 | 类型 |
 |---|---|---|
-| `none` | 不生成 AI 摘要，仅返回转录+OCR 结构化数据 | 无 |
-| `local` | 基于转录文本的本地摘要（jieba 关键词+句子评分） | jieba |
-| `ollama` | 调用本地 Ollama 模型（支持多模态） | Ollama + 下载模型 |
-| `openai` | 调用 OpenAI GPT-4o API（支持帧图片输入） | API Key |
-| `mcp` | MCP 视觉工具（AI Agent 提供，零配置） | MCP 视觉 Server |
+| 设训品 | 奢侈品 | 同音字 |
+| 协率/协力 | 斜率 | 同音字 |
+| 老犯 | 老范 | 同音字 |
+| 长火 | 长虹 | 同音字 |
+| 空桥 | 空调 | 同音字 |
+| 神堂山 | 神坛上 | 同音字 |
+| Cloud | Claude | 英文 |
+| P2T | Peter Thiel | 英文 |
+| 归谷 | 硅谷 | 同音字 |
+| 科学 | Cursor | 上下文 |
 
 ### 使用
 
@@ -448,11 +543,12 @@ python scripts/xhs.py setup-video --mode local --whisper-model base --frame-inte
 python scripts/xhs.py note <video_note_id>
 python scripts/xhs.py download <video_note_id>
 
-# 2. 分析视频内容
+# 2. 分析视频内容（Python 完成转录+OCR）
 python scripts/xhs.py analyze-video <video_note_id>
 
-# 指定 AI 摘要模式（覆盖配置文件）
-python scripts/xhs.py analyze-video <video_note_id> --mode ollama
+# 3. Agent 纠错转录（必须执行，否则文字无法阅读）
+#    读取 DB 中的转录 → 纠正同音字和英文错误 → 写回 DB
+#    详见「Agent 转录纠错」章节
 ```
 
 ### 视频分析耗时预期（重要）
@@ -460,7 +556,8 @@ python scripts/xhs.py analyze-video <video_note_id> --mode ollama
 默认配置针对 **2-5 分钟内的稳定分析** 优化：
 - **Whisper 模型**: 默认 `base`（加载 ~10s，精度与速度平衡），追求速度可改为 `tiny`（快 5 倍但精度低）
 - **最长转录**: 默认只转录前 300 秒（5 分钟）音频，长视频自动截断
-- **典型耗时**: 短视频 60-90s，中等视频 90-180s
+- **Agent 纠错**: 在后续步骤由 Agent 读取 DB 中的转录并纠错（不占用 analyze-video 命令时间）
+- **典型耗时**: 短视频 60-90s，中等视频 90-180s（不含 Agent 纠错）
 
 > **执行要求**：运行 `analyze-video` 时，终端 timeout 设置 **300 秒（5分钟）** 以覆盖绝大多数视频。长视频（>10分钟）如需完整转录，用 `--max-duration 0` 并设置更长 timeout。含 `--download` 的批量命令 timeout 建议 600 秒。
 
@@ -501,8 +598,8 @@ python scripts/xhs.py analyze-video <note_id> --step extract
 # 第2步：语音转录（约 30-120s，设置 timeout>=300s）
 python scripts/xhs.py analyze-video <note_id> --step transcribe
 
-# 第3步：OCR + 摘要（约 10-20s）
-python scripts/xhs.py analyze-video <note_id> --step ocr summary
+# 第3步：OCR + 纠错（约 10-20s）
+python scripts/xhs.py analyze-video <note_id> --step ocr
 ```
 
 中间结果缓存在视频目录的 `_cache/` 下，超时后下次调用自动复用。
@@ -521,58 +618,7 @@ python scripts/xhs.py crawl-user <user_id> --max-pages 20 --no-analyze
 
 ### 输出
 
-分析结果存入 DB（`video_transcript` / `video_ocr_text` / `video_summary` 字段），自动反映到 CSV 导出和 Markdown 渲染中。
-
-### MCP 视频分析工作流
-
-当 `summary_mode` 为 `"mcp"` 时，Python 脚本完成语音转文字 + 关键帧 OCR 后，输出结构化任务清单，AI Agent 使用 MCP 视觉工具完成摘要。
-
-**第一步：运行分析命令**
-```bash
-python scripts/xhs.py analyze-video <note_id>
-```
-
-**第二步：解析 `[MCP_VIDEO_TASK]` 输出**
-
-脚本在 stderr 输出任务清单：
-```
-[MCP_VIDEO_TASK]
-transcript_length: 1500
-keyframe_count: 8
-transcript: |
-  语音转文字的完整内容...
-ocr_text: |
-  [frame_0001] 画面中的文字...
-keyframes:
-  - data/media/博主名/笔记标题/frames/frame_0001.jpg
-  ...
-prompt: |
-  请根据以上视频转录和画面文字信息，生成摘要...
-[/MCP_VIDEO_TASK]
-```
-
-**第三步：使用 MCP 工具分析视频**
-
-根据当前环境可用的 MCP 视觉工具：
-- `analyze_video` → 直接分析视频文件（如 ai-vision-mcp）
-- `analyze_image` → 逐帧分析关键帧图片
-- 综合转录文字 + 画面分析生成摘要
-
-**第四步：写入 DB**
-```bash
-python -c "
-import sys; sys.path.insert(0, 'scripts')
-import xhs_storage, sqlite3
-conn = sqlite3.connect('data/xhs.db')
-xhs_storage.update_video_analysis(conn, '<note_id>', '<transcript>', '<ocr_text>', '<summary>')
-conn.close()
-"
-```
-
-**第五步：重新渲染 MD**
-```bash
-python scripts/xhs.py export --note <note_id> --format md
-```
+分析结果存入 DB（`video_transcript` / `video_ocr_text` 字段），自动反映到 CSV 导出和 Markdown 渲染中。
 
 ---
 
@@ -598,11 +644,8 @@ python scripts/xhs.py export --note <note_id> --format md
 ### 配置
 
 ```bash
-# 交互式配置（推荐首次使用时运行）
-python scripts/xhs.py setup-image
-
-# 或直接指定参数
-python scripts/xhs.py setup-image --mode vision --backend api --no-mermaid
+# 推荐：统一引导向导，一次性配置图片+视频
+python scripts/xhs.py setup-wizard
 ```
 
 配置文件：`data/image_config.json`
@@ -629,10 +672,8 @@ python scripts/xhs.py download <note_id>
 # 2. 分析图片内容
 python scripts/xhs.py analyze-images <note_id>
 
-# 指定模式（覆盖配置文件）
-python scripts/xhs.py analyze-images <note_id> --mode vision
-python scripts/xhs.py analyze-images <note_id> --mode none  # 仅 OCR
-python scripts/xhs.py analyze-images <note_id> --no-mermaid  # 不生成图表
+# 图片分析模式通过 setup-wizard 或 data/image_config.json 配置
+# 可选模式：auto / none / local / vision
 ```
 
 ### 长任务自动分析
@@ -725,13 +766,15 @@ MCP 协议标准：JSON-RPC（`tools/list` 发现 → `tools/call` 调用），s
 
 | 现象 | 原因 | 处理 |
 |---|---|---|
-| `sign-test` 全 FAIL | JS 文件过期或缺失 / 没装 Node + crypto-js | 1) 先确认 `cd assets && npm install crypto-js`；2) 若仍失败再去更新 JS（见下文「签名 JS 月度更新」） |
-| `login` 报 `BrowserNotFound` 或 rookiepy 装不上 | Python 3.13+ 或本地浏览器未登录 | 改 `--prefer qr` 或 `--prefer manual`；最快路径：浏览器 DevTools 复制 cookie 后 `--prefer manual` 粘贴 |
-| `[FETCH] 460 风控 ×3` 连续触发 | 短时请求太多 | 自动会切到 Playwright 接管，无需干预；可再加 `--speed-mode paranoid` |
-| `[FETCH] success=False code=-100` | cookie 过期 | 自动会重新登录并重试，无需干预 |
-| `[FATAL] 达到单账号日抓硬上限 500` | 当日量超出 | 等明天，或换号 |
-| `[FATAL] 风控强度超出处理能力` | 三档全失效 + 浏览器接管也失败 | 等 24h；考虑换 IP；最坏情况换账号 |
-| Playwright 在 WSL/Linux 启动失败 | 缺系统库 | Linux/WSL: `sudo apt install libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2`；macOS/Windows 一般无需额外安装 |
+| `sign-test` 全 FAIL | JS 文件过期或缺失 / 没装 Node + crypto-js | 1) 先确认 `cd assets && npm install crypto-js`；2) 若仍失败运行 `update-js` |
+| `login` 报 `BrowserNotFound` 或 rookiepy 装不上 | Python 3.13+ 或本地浏览器未登录 | 改 `--prefer qr` 或 `--prefer manual` |
+| 搜索返回 -104 | 搜索 API 风控（阿瑞斯最严格入口） | **自动降级到 DOM 搜索**（真实浏览器），无需干预 |
+| 非 API 返回 -104 | b1 令牌过期 | 自动刷新 b1 缓存重试一次，失败再 DOM 降级（搜索）或 FatalRiskError |
+| `[FETCH] 460 风控 ×3` 连续触发 | 短时请求太多 | 自动降速 + 切账号 + 切代理 |
+| `[FETCH] success=False code=-100` | cookie 过期 | 自动重新登录并重试 |
+| `[FATAL] 达到单账号日抓硬上限 80` | 当日 API 请求量超出 | 等明天，或添加更多账号 |
+| `[FATAL] 风控强度超出处理能力` | 所有防线失效 | 等 24h；考虑换 IP；最坏情况换账号 |
+| Playwright 在 WSL/Linux 启动失败 | 缺系统库 | `sudo apt install libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2` |
 | `py_mini_racer` 装不上（ARM Mac 等） | wheel 不匹配 | `pip install PyExecJS` + 安装 Node.js（代码会自动 fallback） |
 
 ---
@@ -788,9 +831,10 @@ python scripts/xhs.py sign-test
   # 视频笔记：
   python scripts/xhs.py analyze-video <note_id>
 
-步骤 5: [MCP 后端时] AI Agent 用 MCP 视觉工具完成分析
-  → 图文：逐张分析图片 → 综合描述 → 写入 DB
-  → 视频：综合转录+OCR+帧画面 → 生成摘要 → 写入 DB
+步骤 5: ⚠️ Agent 纠错/分析（必须执行，不可省略）
+  → 图文：[MCP 后端时] AI Agent 用 MCP 视觉工具逐张分析图片 → 综合描述 → 写入 DB
+  → 视频：`correct --list` 读待纠错转录 + OCR → Agent 纠正同音字/英文错误 → `correct --note <id> --apply "<纠错后>"` 写回
+  → 提示：数据写入命令退出时会自动打印 `⚠️ [CORRECT] 待纠错 N 条`，看到即用 correct 处理，**不要留到"下一步"**。
 
 步骤 6: 重新导出 Markdown（最终渲染，包含所有内容）
   python scripts/xhs.py export --note <note_id> --format md
@@ -1026,61 +1070,193 @@ graph LR
 每次操作后自动输出状态摘要，格式：
 
 ```
-[OK] 《笔记标题》(图文) | 已下载: 3 张图片 | 视频分析: 语音转录 1200 字、AI 摘要 | 图片分析: 图片OCR 500 字、AI 描述 | 5 条评论
+[OK] 《笔记标题》(图文) | 已下载: 3 张图片 | 视频分析: 转录 1200 字、已纠错 | 图片分析: 图片OCR 500 字、AI 描述 | 5 条评论
 ```
 
 ### 自动下载行为
 
-`note` 命令入库后会**自动下载图片**（仅图片，不下视频）到 `data/media/<博主名>/<笔记标题>/`。视频需用户主动执行 `download` 命令。
+`note` 命令入库后会**自动下载图片/视频**到 `data/media/<博主名>/<笔记标题>/`。视频笔记会**自动执行完整视频分析**（下载→转录→OCR→摘要），无需手动执行 `analyze-video`。
 
 ---
 
-## 反风控关键机制（自动启用，无需配置）
+## 反风控关键机制（五层纵深防御，自动启用）
+
+### Layer 1: 签名稳定
 
 | 机制 | 说明 | 控制 |
 |---|---|---|
-| **curl_cffi Chrome TLS 模拟** | 模仿 Chrome 131 的 JA3/JA4 指纹，绕过 TLS 层识别 | `IMPERSONATE_PROFILE`（默认 chrome131） |
-| **Session warmup** | 抓正事前先调 `/api/sns/web/v1/homefeed`，模拟"打开首页"的真实导航 | `Fetcher.warmup()` 首次调用自动触发 |
-| **xsec_token 全链路透传** | search/user 接口返回的 token 自动入库 → 抓 detail 时自动带上（**直访 detail 无 token = 几乎必触发 461**） | `notes.xsec_token` 字段 |
-| **Smart-pacing (burst+rest)** | 不是均匀延迟：连发 3-6 个 → 停 20-60s → 再来一波 — 模仿真人浏览节奏 | `SPEED_PROFILES.normal/slow/paranoid` |
-| **周期 cookie 刷新** | 每 20 次抓取调一次 `/api/sns/web/v2/user/me`，让 `websectiga`/`sec_poison_id` 自然更新 | `COOKIE_REFRESH_EVERY=20` |
-| **完整 Chrome 请求头集** | sec-ch-ua / sec-fetch-* 全套，与真实 Edge 一致 | `_base_headers()` |
-| **响应 Set-Cookie 同步** | 服务端动态更新的 cookie 不丢 | 在 `_call_raw` 自动 |
-| **浏览器接管退路** | 连续 3 次 460 / 任一 461 自动切 Playwright 接管；返回非 JSON（验证页）时弹窗让用户 60s 过滑块 | `PlaywrightTakeover` |
+| **EmbedJsSigner 主签名** | execjs/mini-racer 跑 xhs_main.js，~50ms 签名，无浏览器依赖 | `DEFAULT_CHAIN` 首选 |
+| **PlaywrightSigner 后备** | 真实浏览器跑 window._webmsxyw，免维护算法 | auto 降级链第二档 |
+| **b1 令牌收割** | PlaywrightSigner 每 100 次签名从 localStorage 提取 b1 → b1_cache.json | `PlaywrightSigner._harvest_b1()` |
+| **b1 令牌注入** | EmbedJsSigner 加载 b1_cache.json，替换 xhs_main.js 中的 fff 变量 | `EmbedJsSigner.inject_b1()` |
+| **b1 同步** | AutoSigner 定期从缓存同步 b1 到 EmbedJsSigner | `AutoSigner._sync_b1()` |
+| **浏览器心跳 + 定时刷新** | 每次签名检测 page.evaluate("1+1")；运行超过 2 小时主动关闭重启 | `PlaywrightSigner._ensure_browser()` |
+
+### Layer 2: 传输稳定
+
+| 机制 | 说明 | 控制 |
+|---|---|---|
+| **curl_cffi Chrome TLS 模拟** | 模仿 Chrome 136 的 JA3/JA4 指纹 | `IMPERSONATE_PROFILE` |
+| **-104 b1 刷新 + DOM 降级** | 搜索 -104 → 先刷新 b1 缓存重试 → 失败则降级到真实浏览器 DOM 搜索 | `Fetcher._handle()` |
+| **403 短等待重试** | 等待 30-60s 后重试（非固定 300s） | `Fetcher._handle()` |
+| **429 指数退避** | 60-180s 退避，最多 5 次 | `Fetcher._handle()` |
+| **461 账号冷却 + 切换** | 冷却 120min + 自动切账号 + 浏览器接管 | `Fetcher._handle()` |
+| **xsec_token 全链路透传** | search/user 返回的 token 自动入库 → detail 自动带上 | `notes.xsec_token` |
+| **周期 cookie 刷新** | 随机间隔 15-25 次请求后调 /user/me 更新 websectiga/sec_poison_id | `COOKIE_REFRESH_EVERY=20`（实际随机化） |
+
+### Layer 3: 会话稳定
+
+| 机制 | 说明 | 控制 |
+|---|---|---|
+| **会话间歇休息** | 每 45-60 分钟休息 10-20 分钟，模拟人类离开 | `Fetcher._maybe_session_rest()` |
+| **请求多样性** | 每 10 次真实请求穿插 1 次辅助请求（homefeed/user/me） | `Fetcher._maybe_auxiliary_request()` |
+| **休息后重新 warmup** | 休息结束重新调 homefeed 模拟"回来继续看" | `_warmed = False` |
+
+### Layer 4: 账号稳定
+
+| 机制 | 说明 | 控制 |
+|---|---|---|
+| **时间窗口主动轮换** | 账号活跃 40-60 分钟或本窗口 40 次请求后主动切换 | `Fetcher._should_rotate_for_freshness()` |
+| **窗口请求计数** | 独立计数器，轮换时重置，防止死循环 | `_window_request_count` |
+| **每账号独立指纹** | 独立 UA/sec-ch-ua/impersonate，避免多号同设备 | `FINGERPRINT_POOL` |
+
+### Layer 5: 可观测性
+
+| 机制 | 说明 | 控制 |
+|---|---|---|
+| **结构化 JSONL 日志** | 每次请求记录 API、状态码、业务码、耗时、签名模式、账号、代理 | `xhs_log.log_request()` |
+| **风控事件统计** | 460/461 累计次数，账号状态仪表盘 | `accounts` / `stats` 命令 |
+| **Keepalive b1 收割** | 保活时顺便收割 b1 令牌，保持签名新鲜度 | `xhs_keepalive.keepalive_single_account()` |
+
+### DOM 搜索降级（搜索 -104 专用）
+
+搜索 API 返回 -104 时自动降级到真实浏览器搜索：
+
+1. **真实浏览器模式**（优先）：检测用户的 Edge（Windows）/ Chrome（macOS）→ 关闭 → 用真实 profile 启动 → 完整 cookies + localStorage → 页面 JS 自己调 API（不受 -104 影响）→ 拦截 API 响应数据
+2. **Playwright 降级模式**：注入 cookies 的 best-effort 方案
+
+数据提取链：拦截 API 响应 → __INITIAL_STATE__ 提取 → DOM note_id 提取（三级 fallback）。
 
 ## 实测稳定性
 
-测试环境：Edge 131 + `curl_cffi/chrome131` + `--speed-mode normal`：
+6 小时长跑测试（2 账号，search speed-mode，无代理，五层防御）：
 
-| 场景 | 触发率 | 耗时 |
-|---|---|---|
-| search "露营" 1 页（20 条） | 0% | ~10s |
-| 连抓 5 条 detail（不同 note） | 0% | ~65s |
+| 指标 | 结果 |
+|------|------|
+| 总入库笔记 | 640 条（16 页） |
+| 总下载笔记 | 673 条 |
+| 搜索 -104 → DOM 降级 | 17/17（100% 成功） |
+| FatalRiskError | **0** |
+| 账号主动轮换 | 3 次（49min / 53min / 63min 自动切换） |
+| 图片分析 | 正常（OCR + AI 视觉） |
+| 会话休息 | 按预期在 45-60min 后触发 |
 
-**建议持续负载**（保守值）：
-- `--speed-mode normal`：< 200 条/小时
-- `--speed-mode slow`：< 500 条/天
-- `--speed-mode paranoid`：< 1000 条/天（夜跑）
+**建议持续负载**（保守值，`--speed-mode paranoid` 当前唯一模式）：
+- 约 100-300 条/天（每请求 4-10 分钟，推荐夜跑）
 
 ## 进阶反风控（按需）
 
 当 normal 仍触发 461 时考虑：
 
-1. **降速**：`--speed-mode slow` 或 `paranoid`
-2. **用代理**：`--proxy http://...`（强烈推荐住宅代理，数据中心 IP 易被标记）
-3. **多账号轮换**：每个账号绑独立 `a1` + 独立代理 IP；单账号日抓硬上限 500
-4. **JS 签名升级**：若全档持续 460，去 cv-cat/Spider_XHS 拉最新 `xhs_main_<日期>.js` 覆盖（见下文）
-5. **改 IMPERSONATE_PROFILE**：换 `chrome120` / `safari17` 等其他指纹（防止 chrome131 被专项标记）
+1. **降速**：确认已使用 `--speed-mode paranoid`（当前唯一模式）
+2. **多账号轮换**：每个账号绑独立指纹 + 独立代理 IP；单账号 API 日抓硬上限 80
+3. **JS 签名升级**：若全档持续 460，去 cv-cat/Spider_XHS 拉最新 `xhs_main_<日期>.js` 覆盖
+4. **改 IMPERSONATE_PROFILE**：换 `chrome133a` 等其他指纹（在 `data/config.json` 的 `impersonate_profile` 字段）
+5. **定期保活**：`python scripts/xhs.py keepalive --daemon` 定期刷新 cookie + 收割 b1
+
+---
+
+## Postgres & Hub 集成（Adapter B 模式）
+
+### 架构
+
+爬虫本身只写本地 SQLite（零配置），Hub 集成通过外部适配器 `hub_adapter.py` 实现：
+
+```
+xhs.py 爬取       →  SQLite (xhs.db)     本地缓存 + 导出数据源
+hub_adapter.py    →  读取 SQLite 同步到 Postgres（upsert）
+financial_hub     →  爬虫生命周期管理（notify_start / notify_end）
+```
+
+**工作流程**：
+1. `hub_adapter.py` 从 Hub `crawl_targets` 获取启用的 xiaohongshu 目标
+2. subprocess 调用 `xhs.py crawl-search/crawl-feed/crawl-user` 执行爬取
+3. 爬取完成后，读取本地 SQLite 同步到 Hub PG（notes/users/comments/search_cache/crawl_state）
+4. 通知 Hub 爬取周期完成（成功/失败 + 耗时 + 错误信息）
+
+**target_identifier 约定**：
+- `search:KEYWORD` → `xhs.py crawl-search --keyword KEYWORD`
+- `user:USER_ID` → `xhs.py crawl-user --user-id USER_ID`
+- `feed` → `xhs.py crawl-feed`
+
+### 模块
+
+| 文件 | 功能 |
+|---|---|
+| `hub_adapter.py` | Hub 适配器：获取目标 → subprocess 爬取 → SQLite→PG 同步 → 生命周期通知 |
+| `schema.sql` | Postgres 建表 DDL（xhs_notes / xhs_users / xhs_comments / xhs_search_cache / xhs_crawl_state） |
+| `xhs_risk_status.py` | 风控事件查看器：查询 Hub PG 的 system_events 表 |
+| `SKILL_SETUP.md` | Hub 自动安装入口（venv + 依赖 + .env 配置） |
+| `.env.example` | Postgres 环境变量模板 |
+| `requirements-hub.txt` | Hub 集成额外依赖（psycopg2-binary / python-dotenv / financial_hub_postgres） |
+
+### 运行方式
+
+```bash
+# 单次运行：处理所有启用的 xiaohongshu 目标
+python hub_adapter.py
+
+# 指定目标
+python hub_adapter.py --target-id=42
+```
+
+### Postgres 环境配置
+
+```bash
+# 独立环境变量（也支持 .env 文件，python-dotenv 自动加载）
+export POSTGRES_HOST=localhost
+export POSTGRES_PORT=5432
+export POSTGRES_USER=xhs
+export POSTGRES_PASSWORD=secret
+export POSTGRES_DB=financial_hub   # 实际库名，如 financial_hub_v2
+```
+
+### 降级行为
+
+爬虫本身（xhs.py）不直接连接 Postgres，因此 **Postgres 不可用不影响爬取**。只有 `hub_adapter.py` 需要 Postgres 连接，失败时同步步骤会报错但不影响已写入 SQLite 的数据。
+
+### 跨平台浏览器适配
+
+登录和 DOM 搜索覆盖三大平台：
+
+| 平台 | Edge | Chrome | 说明 |
+|------|------|--------|------|
+| Windows | 原生提取 + DOM 搜索 | 原生提取 + DOM 搜索 | rookiepy 或 native 模块 |
+| macOS | 原生提取 + DOM 搜索 | 原生提取 + DOM 搜索 | `xhs_login_native.py` |
+| WSL | — | — | CDP 桥接到 Windows Edge/Chrome |
+
+登录 fallback 链（auto 模式）：rookiepy → native-edge → native-chrome → wsl-edge-cdp → wsl-edge → wsl-chrome-cdp → wsl-chrome → QR → manual。
 
 ---
 
 ## 安全与合规
 
 - **强烈建议小号**：账号封禁不可逆
-- **单账号日抓硬上限 500 条**（DAILY_HARD_CAP 写死在代码里）
-- **Cookie 落盘 `data/cookies.json`，权限 0600**
+- **单账号 API 日抓硬上限 80 条**（DAILY_HARD_CAP，可通过 config.json 调整）
+- **单账号 DOM 搜索上限 100 页/天**（DOM_SEARCH_DAILY_CAP，独立计数）
+- **Cookie 落盘 `data/cookies.json`，权限 0600（Windows 通过 icacls 设置 ACL，可能静默失败）**
 - **仅供个人学习研究**，禁止商业用途、禁止转售、禁止大规模数据收集
 - **遵守 robots.txt 与平台 ToS**
+
+### 内置安全限制
+
+| 限制 | 值 | 说明 |
+|------|-----|------|
+| 单账号 API 日抓上限 | 80 条 | DAILY_HARD_CAP（详情/评论/用户信息/feed API，达到后当日停止） |
+| 单账号 DOM 搜索上限 | 100 页/天 | DOM_SEARCH_DAILY_CAP（浏览器搜索，独立计数，可通过 config.json 调整） |
+| 同 IP 日总上限 | 80 条 | IP_DAILY_CAP，所有账号 API 合计 |
+| 搜索 API 配额 | 3 次/小时 | SEARCH_HOURLY_QUOTA，超出自动降级 DOM 搜索 |
+| 静默期倍率 | 完全停止（1:00-6:00） | QUIET_HOURS 时段暂停爬取，非静默期正常 |
 
 ---
 
@@ -1090,10 +1266,17 @@ graph LR
 |---|---|---|
 | P1 MVP | ✅ 完成 | login / sign-test / note / user / search / export |
 | P1.5 反风控 | ✅ 完成 | curl_cffi Chrome TLS / warmup / xsec_token 透传 / smart-pacing / cookie 刷新 |
-| **P2 强化** | ✅ **完成** | **comments 评论树 / download 媒体本地化 / crawl-search & crawl-user 断点续抓 / 浏览器接管 JSON 修复** |
-| **P3 扩展** | ✅ **完成** | **feed 推荐流 / refresh-cookies token 自动刷新 / analyze 情感分析+话题聚类 / update-js 自动更新 / accounts+stats 子命令** |
-| **P4 视频** | ✅ **完成** | **视频内容智能分析：语音转文字（faster-whisper）+ 关键帧 OCR（rapidocr）+ 5 档 AI 摘要（none/local/ollama/openai/mcp）+ 视频流式下载 + DB 视频字段 + CSV/MD 视频增强** |
-| **P5 图片** | ✅ **完成** | **图片智能分析：OCR 文字提取（rapidocr）+ AI 视觉描述（Ollama/OpenAI兼容API/MCP视觉工具）+ Mermaid 路线图/流程图 + DB 图片字段 + CSV/MD 图片分析段落 + 批量 crawl 自动触发** |
+| P2 强化 | ✅ 完成 | comments 评论树 / download 媒体本地化 / crawl-search & crawl-user 断点续抓 / 浏览器接管 |
+| P3 扩展 | ✅ 完成 | feed 推荐流 / refresh-cookies / analyze 情感分析+话题聚类 / update-js / accounts+stats |
+| P4 视频 | ✅ 完成 | 视频智能分析：faster-whisper + rapidocr + 转录纠错（correct）+ 流式下载 |
+| P5 图片 | ✅ 完成 | 图片智能分析：OCR + AI 视觉 + Mermaid + MCP 视觉工具支持 |
+| **P6 五层防御** | ✅ **完成** | **b1 收割注入 / 搜索 -104 DOM 降级 / 会话间歇休息 / 请求多样性 / 账号时间窗口轮换 / 浏览器 2h 定时刷新 / keepalive b1 收割 / Mac DOM 搜索支持** |
+| **P7 Hub 集成** | ✅ **完成** | **Adapter B 模式：hub_adapter.py（subprocess 爬取 + SQLite→PG 同步 + lifecycle 通知） / financial_hub_postgres 生命周期管理 / xhs_risk_status.py 风控事件查看 / 跨平台浏览器适配（Windows Edge/Chrome + macOS Chrome/Edge + WSL CDP 桥接）** |
+| **P8 Hub 自动安装** | ✅ **完成** | **SKILL_SETUP.md（Hub 自动安装入口） / .env.example（环境变量模板） / venv + 依赖自动安装** |
+
+### Hub 自动安装
+
+本爬虫支持 Hub 自动安装：Hub 读取 `SKILL_SETUP.md` 自动创建 venv、安装依赖、配置数据库连接。详见 `SKILL_SETUP.md`。
 
 ---
 
@@ -1103,32 +1286,42 @@ graph LR
 xiaohongshu_scraper_skill/
 ├── SKILL.md                 # 本文件
 ├── README.md                # 快速开始文档
-├── TECHNICAL_REPORT.md      # 完整技术报告
-├── requirements.txt
+├── requirements.txt         # 核心依赖
+├── requirements-hub.txt     # Hub 集成额外依赖
+├── hub_adapter.py           # Hub 适配器（Adapter B 模式）
+├── schema.sql               # Postgres 建表 DDL
+├── SKILL_SETUP.md           # Hub 自动安装入口
+├── .env.example             # Postgres 环境变量模板
 ├── scripts/
 │   ├── xhs.py               # CLI 入口 + 命令调度
 │   ├── xhs_config.py        # 统一配置 + 路径 + 共享工具 + 指纹池
-│   ├── xhs_fetcher.py       # Fetcher 核心类（TLS+节流+风控+浏览器接管）
+│   ├── xhs_fetcher.py       # Fetcher（TLS+节流+风控+DOM搜索+会话管理+账号轮换）
 │   ├── xhs_api.py           # API 调用层 + 数据标准化
 │   ├── xhs_media.py         # 媒体下载 + 后处理编排
-│   ├── xhs_sign.py          # 三档签名引擎 + auto 路由
+│   ├── xhs_sign.py          # 三档签名 + b1 收割/注入 + auto 路由
 │   ├── xhs_login.py         # 跨平台多档登录 fallback（rookiepy/原生提取/QR/手动）
 │   ├── xhs_login_native.py  # 跨平台浏览器 Cookie 提取（Windows/macOS/Linux）
 │   ├── xhs_login_wsl.py     # WSL 环境 CDP 桥接登录
 │   ├── xhs_storage.py       # SQLite 存储 + Markdown/CSV 渲染
 │   ├── xhs_accounts.py      # 多账号池（LRU 轮换 + 冷却 + 指纹绑定）
 │   ├── xhs_proxy.py         # 代理池（轮换 + 指数冷却）
+│   ├── xhs_keepalive.py     # Cookie 自动保活 + b1 收割
 │   ├── xhs_log.py           # 结构化 JSONL 请求日志
 │   ├── xhs_analyze.py       # 评论情感分析 + 话题聚类
 │   ├── xhs_update_js.py     # 签名 JS 自动更新（从 GitHub）
-│   ├── xhs_video.py         # 视频分析（语音转写 + OCR + AI 摘要）
+│   ├── xhs_video.py         # 视频分析（语音转写 + OCR + LLM 纠错）
 │   ├── xhs_image.py         # 图片分析（OCR + AI 视觉 + Mermaid）
-│   └── xhs_bootstrap.py     # 依赖自动安装
+│   ├── xhs_bootstrap.py     # 依赖自动安装
+│   ├── xhs_risk_status.py  # 风控事件查看器（查询 Hub PG system_events）
 ├── assets/                  # 签名 JS 资产
 │   ├── xhs_main.js          # 主签名算法（社区维护，约月度轮换）
-│   ├── xhs_rap.js           # x-rap-param 签名
-│   ├── xhs_xray.js          # x-xray-traceid 签名
-│   └── crypto-js.min.js     # CryptoJS（mini-racer 路径用）
+│   ├── xhs_rap.js           # x-rap-param 签名（注：非必需，生成失败不影响 API）
+│   ├── xhs_xray.js          # x-xray-traceid 签名（必需）
+│   ├── xhs_xray_pack1.js    # xhs_xray.js webpack bundle 1
+│   ├── xhs_xray_pack2.js    # xhs_xray.js webpack bundle 2
+│   ├── xhs_a1.js            # a1 令牌生成
+│   ├── crypto-js.min.js     # CryptoJS（mini-racer 路径用）
+│   └── package.json         # Node 依赖声明
 ├── tests/                   # 测试套件（pytest）
 │   ├── conftest.py           # 共享 fixture
 │   ├── test_normalize.py     # API 数据标准化测试
@@ -1139,6 +1332,7 @@ xiaohongshu_scraper_skill/
 └── data/                     # 运行时数据（自动生成）
     ├── accounts/<alias>.json # 多账号 Cookie 文件
     ├── accounts_state.json   # 账号运行时状态
+    ├── b1_cache.json         # b1 令牌缓存（keepalive 时收割）
     ├── cookies.json           # 单账号 Cookie（兼容）
     ├── xhs.db                # SQLite 数据库
     ├── runs.jsonl             # 请求日志

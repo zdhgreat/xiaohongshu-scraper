@@ -37,10 +37,60 @@ def _ensure_scripts_path() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Cookie 元数据辅助
+# ---------------------------------------------------------------------------
+
+_RICH_COOKIE_KEYS = ("domain", "path", "secure", "httpOnly", "sameSite", "expires")
+
+
+def _build_cookie_result(
+    raw_cookies: list[dict],
+    domain_filter: str = "xiaohongshu",
+) -> tuple[dict[str, str], dict[str, dict]]:
+    """从 Playwright/rookiepy cookie 列表构建 (cookies, cookie_meta)。
+
+    cookies: name → value（扁平字典，向后兼容）
+    cookie_meta: name → {domain, path, secure, ...}（富元数据）
+    """
+    cookies: dict[str, str] = {}
+    cookie_meta: dict[str, dict] = {}
+    for c in raw_cookies:
+        if domain_filter and domain_filter not in c.get("domain", ""):
+            continue
+        name = c["name"]
+        cookies[name] = c["value"]
+        meta = {k: c[k] for k in _RICH_COOKIE_KEYS if k in c and c[k] is not None}
+        if meta:
+            cookie_meta[name] = meta
+    return cookies, cookie_meta
+
+
+def _build_sqlite_cookie_meta(
+    host: str, path: str, secure: bool | int,
+    httponly: bool | int, samesite: int | str | None,
+    expiry: int | float | None,
+) -> dict:
+    """从 SQLite 行字段构建 cookie 元数据字典。"""
+    meta: dict = {"domain": host, "path": path}
+    if int(secure):
+        meta["secure"] = True
+    if int(httponly):
+        meta["httpOnly"] = True
+    if samesite is not None:
+        if isinstance(samesite, int):
+            meta["sameSite"] = {0: "None", 1: "Lax", 2: "Strict"}.get(samesite, "Lax")
+        elif samesite:
+            meta["sameSite"] = str(samesite)
+    if expiry and float(expiry) > 0:
+        meta["expires"] = float(expiry)
+    return meta
+
+
+# ---------------------------------------------------------------------------
 # WSL 档（动态导入，避免非 WSL 环境强制依赖 cryptography）
 # ---------------------------------------------------------------------------
 
-def acquire_via_wsl_browser_cdp(browser: str = "edge") -> dict[str, str]:
+def acquire_via_wsl_browser_cdp(browser: str = "edge") -> tuple[dict[str, str], dict[str, dict]]:
     _ensure_scripts_path()
     try:
         import xhs_login_wsl  # type: ignore
@@ -52,7 +102,7 @@ def acquire_via_wsl_browser_cdp(browser: str = "edge") -> dict[str, str]:
         raise LoginError(f"WSL {browser} CDP 登录失败：{e}")
 
 
-def acquire_via_wsl_browser(browser: str = "edge") -> dict[str, str]:
+def acquire_via_wsl_browser(browser: str = "edge") -> tuple[dict[str, str], dict[str, dict]]:
     _ensure_scripts_path()
     try:
         import xhs_login_wsl  # type: ignore
@@ -79,18 +129,23 @@ def cookies_from_str(s: str) -> dict[str, str]:
     return out
 
 
-def persist_cookies(cookies: dict[str, str]) -> Path:
+def persist_cookies(cookies: dict[str, str], cookie_meta: dict[str, dict] | None = None) -> Path:
     COOKIES_PATH.parent.mkdir(parents=True, exist_ok=True)
-    COOKIES_PATH.write_text(json.dumps(cookies, ensure_ascii=False, indent=2), encoding="utf-8")
+    data = {"_version": 2, "cookies": cookies, "cookie_meta": cookie_meta or {}}
+    COOKIES_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     _restrict_file(COOKIES_PATH)
     return COOKIES_PATH
 
 
-def load_cookies() -> dict[str, str] | None:
+def load_cookies() -> tuple[dict[str, str], dict[str, dict]] | None:
     if not COOKIES_PATH.exists():
         return None
     try:
-        return json.loads(COOKIES_PATH.read_text(encoding="utf-8"))
+        raw = json.loads(COOKIES_PATH.read_text(encoding="utf-8"))
+        if isinstance(raw, dict) and raw.get("_version") == 2:
+            return raw.get("cookies", {}), raw.get("cookie_meta", {})
+        # v1: flat dict
+        return raw, {}
     except Exception:
         return None
 
@@ -104,7 +159,8 @@ def validate_cookies(cookies: dict[str, str]) -> dict[str, Any] | None:
     if not REQUIRED_KEYS.issubset(cookies.keys()):
         return None
     # 弱校验：键齐全就当有效，留给上层 Fetcher 在实际调用时判定真正过期
-    return {"user_id": cookies.get("unread", ""), "via": "weak-check"}
+    # 注意：不返回假 user_id，调用方应使用在线验证获取真实 user_id
+    return {"via": "weak-check"}
 
 
 def validate_cookies_online(cookies: dict[str, str], fingerprint=None) -> tuple[bool, dict[str, Any] | None, dict[str, str]]:
@@ -139,10 +195,7 @@ def validate_cookies_online(cookies: dict[str, str], fingerprint=None) -> tuple[
         "content-type": "application/json;charset=UTF-8",
         "origin": "https://www.xiaohongshu.com",
         "referer": "https://www.xiaohongshu.com/",
-        "user-agent": fingerprint.user_agent if fingerprint else (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0"
-        ),
+        "user-agent": fingerprint.user_agent if fingerprint else xhs_config.USER_AGENT,
         **sign_headers,
     }
 
@@ -150,7 +203,7 @@ def validate_cookies_online(cookies: dict[str, str], fingerprint=None) -> tuple[
         resp = requests.get(url, headers=headers, cookies=cookies, timeout=15)
     except Exception as e:
         print(f"[VALIDATE] 网络异常：{e}", file=sys.stderr)
-        return True, None, cookies  # 网络问题不判死
+        return None, None, cookies  # 网络问题，返回 None 表示未知状态
 
     # 同步 Set-Cookie
     updated = dict(cookies)
@@ -178,7 +231,7 @@ def validate_cookies_online(cookies: dict[str, str], fingerprint=None) -> tuple[
 # 档位 1: rookiepy
 # ---------------------------------------------------------------------------
 
-def acquire_via_rookiepy() -> dict[str, str]:
+def acquire_via_rookiepy() -> tuple[dict[str, str], dict[str, dict]]:
     try:
         import rookiepy  # type: ignore
     except ImportError as e:
@@ -201,10 +254,10 @@ def acquire_via_rookiepy() -> dict[str, str]:
             continue
         if not raw:
             continue
-        cookies = {c["name"]: c["value"] for c in raw}
+        cookies, cookie_meta = _build_cookie_result(raw, domain_filter="xiaohongshu")
         if REQUIRED_KEYS.issubset(cookies.keys()):
             print(f"[LOGIN] rookiepy {name}: 提取 {len(cookies)} 个 cookie", file=sys.stderr)
-            return cookies
+            return cookies, cookie_meta
     raise LoginError("rookiepy 未在任何浏览器找到完整的小红书 cookie（需要先在浏览器登录过）")
 
 
@@ -213,7 +266,7 @@ def acquire_via_rookiepy() -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 def acquire_via_playwright_qr(headless: bool = False, timeout_s: int = 240,
-                               profile_hint: str = "", channel: str = "") -> dict[str, str]:
+                               profile_hint: str = "", channel: str = "") -> tuple[dict[str, str], dict[str, dict]]:
     try:
         from playwright.sync_api import sync_playwright  # type: ignore
     except ImportError as e:
@@ -241,9 +294,11 @@ def acquire_via_playwright_qr(headless: bool = False, timeout_s: int = 240,
             page.goto("https://www.xiaohongshu.com/explore", wait_until="domcontentloaded")
             start = time.time()
             cookies: dict[str, str] = {}
+            cookie_meta: dict[str, dict] = {}
             last_check = 0.0
             while time.time() - start < timeout_s:
-                ck = {c["name"]: c["value"] for c in browser.cookies()}
+                raw_ck = browser.cookies()
+                ck, cm = _build_cookie_result(raw_ck, domain_filter="")
                 if REQUIRED_KEYS.issubset(ck.keys()):
                     # 调 user/me 校验是真登录还是 guest
                     now = time.time()
@@ -261,6 +316,7 @@ def acquire_via_playwright_qr(headless: bool = False, timeout_s: int = 240,
                             is_logged_in = False
                         if is_logged_in:
                             cookies = ck
+                            cookie_meta = cm
                             break
                         # 否则继续等待用户在手机 App 上点"确认"
                 time.sleep(2)
@@ -269,14 +325,14 @@ def acquire_via_playwright_qr(headless: bool = False, timeout_s: int = 240,
         if not cookies:
             raise LoginError(f"{timeout_s}s 内未完成登录确认（扫码后请在手机 App 上点'确认登录'）")
         print(f"[LOGIN] QR 登录确认成功，{len(cookies)} 个 cookie", file=sys.stderr)
-        return cookies
+        return cookies, cookie_meta
 
 
 # ---------------------------------------------------------------------------
 # 档位 2.5: Profile Session 恢复（headless，无需人工）
 # ---------------------------------------------------------------------------
 
-def acquire_via_profile_restore(alias: str, timeout_s: int = 30) -> dict[str, str]:
+def acquire_via_profile_restore(alias: str, timeout_s: int = 30) -> tuple[dict[str, str], dict[str, dict]]:
     """利用 Playwright persistent profile 的 session 恢复能力获取 cookie。
 
     与 acquire_via_playwright_qr 的区别：
@@ -317,7 +373,8 @@ def acquire_via_profile_restore(alias: str, timeout_s: int = 30) -> dict[str, st
             page.wait_for_timeout(wait_s * 1000)
 
             # 检查 cookie 是否齐全
-            ck = {c["name"]: c["value"] for c in browser.cookies()}
+            raw_ck = browser.cookies()
+            ck, cm = _build_cookie_result(raw_ck, domain_filter="")
             if not REQUIRED_KEYS.issubset(ck.keys()):
                 raise LoginError("profile 中 session 已过期（cookie 不完整）")
 
@@ -340,7 +397,7 @@ def acquire_via_profile_restore(alias: str, timeout_s: int = 30) -> dict[str, st
             browser.close()
 
     print(f"[LOGIN] Profile 恢复成功（{alias}），{len(ck)} 个 cookie", file=sys.stderr)
-    return ck
+    return ck, cm
 
 
 # ---------------------------------------------------------------------------
@@ -378,20 +435,13 @@ def acquire_via_manual() -> dict[str, str]:
 # 档位 1.5: 跨平台原生浏览器 cookie 提取（无需 rookiepy）
 # ---------------------------------------------------------------------------
 
-def acquire_via_native_browser(browser: str = "edge") -> dict[str, str]:
+def acquire_via_native_browser(browser: str = "edge") -> tuple[dict[str, str], dict[str, dict]]:
     """跨平台：用 Playwright 读取用户真实浏览器配置中的 cookie。
 
     支持 Windows / macOS / Linux 的 Edge 和 Chrome。
     WSL 不适用（由 wsl-* tier 处理）。
+    返回 (cookies, cookie_meta)。
     """
-    try:
-        import xhs_login_native  # type: ignore
-    except ImportError as e:
-        raise LoginError(f"无法加载 cookie 提取模块：{e}")
-    try:
-        return xhs_login_native.extract_cookies(browser)
-    except (FileNotFoundError, ValueError, OSError) as e:
-        raise LoginError(f"{browser} cookie 提取失败：{e}")
     try:
         import xhs_login_native  # type: ignore
     except ImportError as e:
@@ -430,38 +480,47 @@ def _current_platform() -> str:
 
 # 平台特定 tier 名称集合
 _WSL_TIERS = {"wsl-edge", "wsl-edge-cdp", "wsl-chrome", "wsl-chrome-cdp"}
-_NATIVE_TIERS = {"native-edge", "native-chrome"}
+_NATIVE_TIERS = {"native-edge", "native-chrome", "native-firefox", "native-brave"}
 
 
 # ---------------------------------------------------------------------------
 # 入口
 # ---------------------------------------------------------------------------
 
-def acquire_cookies(prefer: str = "auto", headless_qr: bool = False, profile_hint: str = "") -> dict[str, str]:
-    """多档 fallback。prefer ∈ {auto, rookie, edge, chrome, native, wsl-edge, wsl-chrome, qr, manual}。
+def acquire_cookies(prefer: str = "auto", headless_qr: bool = False, profile_hint: str = "") -> tuple[dict[str, str], dict[str, dict]]:
+    """多档 fallback。prefer ∈ {auto, rookie, edge, chrome, firefox, brave, native, wsl-edge, wsl-chrome, qr, manual}。
 
     auto：根据平台自动选择最优链（非 WSL 环境自动跳过 WSL tier）。
     profile_hint: 多账号时传入别名，QR 登录用独立 profile 避免冲突。
+    返回 (cookies, cookie_meta)。
     """
     # 向后兼容旧名称
     compat = {"win-edge": "native-edge", "win-chrome": "native-chrome"}
     prefer = compat.get(prefer, prefer)
 
+    _native_chain = ["native-edge", "native-chrome", "native-firefox", "native-brave"]
+    _native_fb = ["rookie", "qr", "manual"]
+    _wsl_chain = ["wsl-edge-cdp", "wsl-edge", "wsl-chrome-cdp", "wsl-chrome", "qr", "manual"]
+
     chain = {
-        "auto":            ["rookie", "native-edge", "native-chrome", "wsl-edge-cdp", "wsl-edge", "wsl-chrome-cdp", "wsl-chrome", "qr", "manual"],
-        "rookie":          ["rookie", "native-edge", "native-chrome", "wsl-edge-cdp", "wsl-edge", "wsl-chrome-cdp", "wsl-chrome", "qr", "manual"],
-        "native":          ["native-edge", "native-chrome", "rookie", "qr", "manual"],
-        "edge":            ["native-edge", "rookie", "qr", "manual"],
-        "chrome":          ["native-chrome", "rookie", "qr", "manual"],
-        "native-edge":     ["native-edge", "native-chrome", "rookie", "qr", "manual"],
-        "native-chrome":   ["native-chrome", "native-edge", "rookie", "qr", "manual"],
+        "auto":            ["rookie"] + _native_chain + _wsl_chain,
+        "rookie":          ["rookie"] + _native_chain + _wsl_chain,
+        "native":          _native_chain + _native_fb,
+        "edge":            ["native-edge"] + _native_fb,
+        "chrome":          ["native-chrome"] + _native_fb,
+        "firefox":         ["native-firefox"] + _native_fb,
+        "brave":           ["native-brave"] + _native_fb,
+        "native-edge":     _native_chain + _native_fb,
+        "native-chrome":   ["native-chrome"] + ["native-edge", "native-firefox", "native-brave"] + _native_fb,
+        "native-firefox":  ["native-firefox"] + ["native-edge", "native-chrome", "native-brave"] + _native_fb,
+        "native-brave":    ["native-brave"] + ["native-edge", "native-chrome", "native-firefox"] + _native_fb,
         "wsl-edge":        ["wsl-edge", "wsl-edge-cdp", "wsl-chrome-cdp", "wsl-chrome", "qr", "manual"],
         "wsl-edge-cdp":    ["wsl-edge-cdp", "wsl-edge", "wsl-chrome-cdp", "wsl-chrome", "qr", "manual"],
         "wsl-chrome":      ["wsl-chrome", "wsl-chrome-cdp", "wsl-edge-cdp", "wsl-edge", "qr", "manual"],
         "wsl-chrome-cdp":  ["wsl-chrome-cdp", "wsl-chrome", "wsl-edge-cdp", "wsl-edge", "qr", "manual"],
         "qr":              ["qr", "manual"],
         "manual":          ["manual"],
-    }.get(prefer, ["rookie", "native-edge", "native-chrome", "wsl-edge-cdp", "wsl-edge", "wsl-chrome-cdp", "wsl-chrome", "qr", "manual"])
+    }.get(prefer, ["rookie"] + _native_chain + _wsl_chain)
 
     # 非 WSL 环境自动跳过 WSL tier（避免无意义的错误输出）
     _plat = _current_platform()
@@ -475,33 +534,38 @@ def acquire_cookies(prefer: str = "auto", headless_qr: bool = False, profile_hin
     for tier in chain:
         try:
             if tier in ("native-edge", "edge"):
-                cookies = acquire_via_native_browser("edge")
+                cookies, cookie_meta = acquire_via_native_browser("edge")
             elif tier in ("native-chrome", "chrome"):
-                cookies = acquire_via_native_browser("chrome")
+                cookies, cookie_meta = acquire_via_native_browser("chrome")
+            elif tier in ("native-firefox", "firefox"):
+                cookies, cookie_meta = acquire_via_native_browser("firefox")
+            elif tier in ("native-brave", "brave"):
+                cookies, cookie_meta = acquire_via_native_browser("brave")
             elif tier == "rookie":
-                cookies = acquire_via_rookiepy()
+                cookies, cookie_meta = acquire_via_rookiepy()
             elif tier == "wsl-edge":
-                cookies = acquire_via_wsl_browser("edge")
+                cookies, cookie_meta = acquire_via_wsl_browser("edge")
             elif tier == "wsl-edge-cdp":
-                cookies = acquire_via_wsl_browser_cdp("edge")
+                cookies, cookie_meta = acquire_via_wsl_browser_cdp("edge")
             elif tier == "wsl-chrome":
-                cookies = acquire_via_wsl_browser("chrome")
+                cookies, cookie_meta = acquire_via_wsl_browser("chrome")
             elif tier == "wsl-chrome-cdp":
-                cookies = acquire_via_wsl_browser_cdp("chrome")
+                cookies, cookie_meta = acquire_via_wsl_browser_cdp("chrome")
             elif tier == "qr":
-                cookies = acquire_via_playwright_qr(headless=headless_qr, profile_hint=profile_hint)
+                cookies, cookie_meta = acquire_via_playwright_qr(headless=headless_qr, profile_hint=profile_hint)
             else:
                 cookies = acquire_via_manual()
+                cookie_meta = {}
         except LoginError as e:
             print(f"[LOGIN] tier={tier} 失败：{e}", file=sys.stderr)
             last_err = e
             continue
-        return cookies
+        return cookies, cookie_meta
 
     raise LoginError(f"所有登录档位均失败：{last_err}")
 
 
 if __name__ == "__main__":
-    ck = acquire_cookies()
-    persist_cookies(ck)
+    ck, cm = acquire_cookies()
+    persist_cookies(ck, cm)
     print(f"saved {len(ck)} cookies to {COOKIES_PATH}")

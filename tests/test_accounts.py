@@ -180,3 +180,67 @@ class TestMultiAccountFiles:
         assert mgr2.accounts["x"].daily_count == 42
         assert mgr2.accounts["x"].total_calls == 100
         assert mgr2.accounts["x"].last_460_count == 2
+
+
+class TestCookieMetaStorage:
+    """测试 cookie v1/v2 格式迁移和 roundtrip。"""
+
+    def test_load_v1_flat_format(self, tmp_path, monkeypatch):
+        """v1 扁平格式加载后 cookie_meta 为空。"""
+        acc_dir = tmp_path / "accounts"
+        acc_dir.mkdir()
+        (acc_dir / "old.json").write_text(
+            json.dumps({"web_session": "ws", "a1": "a1"}), encoding="utf-8")
+        monkeypatch.setattr("xhs_accounts.ACCOUNTS_DIR", acc_dir)
+        monkeypatch.setattr("xhs_accounts.ACCOUNTS_STATE", tmp_path / "state.json")
+
+        mgr = AccountManager()
+        acc = mgr.accounts["old"]
+        assert acc.cookies["web_session"] == "ws"
+        assert acc.cookie_meta == {}
+
+    def test_load_v2_format(self, tmp_path, monkeypatch):
+        """v2 格式加载后 cookies 和 cookie_meta 都有值。"""
+        acc_dir = tmp_path / "accounts"
+        acc_dir.mkdir()
+        (acc_dir / "new.json").write_text(json.dumps({
+            "_version": 2,
+            "cookies": {"web_session": "ws", "a1": "a1"},
+            "cookie_meta": {
+                "web_session": {"domain": ".xiaohongshu.com", "path": "/", "secure": True}
+            }
+        }), encoding="utf-8")
+        monkeypatch.setattr("xhs_accounts.ACCOUNTS_DIR", acc_dir)
+        monkeypatch.setattr("xhs_accounts.ACCOUNTS_STATE", tmp_path / "state.json")
+
+        mgr = AccountManager()
+        acc = mgr.accounts["new"]
+        assert acc.cookies["web_session"] == "ws"
+        assert acc.cookie_meta["web_session"]["domain"] == ".xiaohongshu.com"
+        assert acc.cookie_meta["web_session"]["secure"] is True
+
+    def test_save_load_roundtrip(self, tmp_path):
+        """save_cookies 后 reload，cookies 和 cookie_meta 内容一致。"""
+        from xhs_config import restrict_file
+        p = tmp_path / "roundtrip.json"
+        acc = Account(alias="rt", cookies_path=p,
+                      cookies={"web_session": "ws", "a1": "a1"},
+                      cookie_meta={"web_session": {"domain": ".xhscdn.com", "path": "/"}})
+        acc.save_cookies()
+
+        acc2 = Account(alias="rt", cookies_path=p)
+        acc2.load()
+        assert acc2.cookies == {"web_session": "ws", "a1": "a1"}
+        assert acc2.cookie_meta["web_session"]["domain"] == ".xhscdn.com"
+
+    def test_empty_meta_no_error(self, tmp_path):
+        """cookie_meta 为空时 save/load 不报错。"""
+        p = tmp_path / "empty.json"
+        acc = Account(alias="em", cookies_path=p,
+                      cookies={"a1": "val"}, cookie_meta={})
+        acc.save_cookies()
+
+        acc2 = Account(alias="em", cookies_path=p)
+        acc2.load()
+        assert acc2.cookies == {"a1": "val"}
+        assert acc2.cookie_meta == {}

@@ -9,12 +9,13 @@
 
 策略：
 - 取下一个可用代理（round-robin + 跳过冷却中的）
-- 失败标记冷却 5 分钟（首次）→ 30 分钟（连续多次失败）
+- 失败标记冷却 5 分钟（首次）→ 30 分钟（连续多次失败），加随机抖动
 - 全部冷却时返回 None（让 Fetcher 决定走直连或停抓）
 """
 
 from __future__ import annotations
 
+import random as _random
 import sys
 import time
 from dataclasses import dataclass, field
@@ -46,10 +47,12 @@ class Proxy:
 
     def mark_failure(self) -> None:
         self.fail_count += 1
-        # 失败次数越多冷却越久
+        # 失败次数越多冷却越久，加随机抖动
         cooldown_min = min(5 * (2 ** (self.fail_count - 1)), 60)
-        self.cooldown_until = time.time() + cooldown_min * 60
-        print(f"[PROXY {self.label}] 失败 #{self.fail_count}，冷却 {cooldown_min}min",
+        jitter = _random.uniform(-60, 120)  # ±1-2 分钟抖动
+        actual = max(cooldown_min * 60 + jitter, 60)  # 至少 1 分钟
+        self.cooldown_until = time.time() + actual
+        print(f"[PROXY {self.label}] 失败 #{self.fail_count}，冷却 {actual/60:.0f}min",
               file=sys.stderr)
 
     def mark_success(self) -> None:
@@ -68,6 +71,12 @@ class ProxyPool:
                 for line in PROXIES_FILE.read_text(encoding="utf-8").splitlines()
                 if line.strip() and not line.strip().startswith("#")
             ]
+            # 保护含认证信息的代理文件权限
+            try:
+                from xhs_config import restrict_file as _rf
+                _rf(PROXIES_FILE)
+            except Exception:
+                pass
         self.proxies = [Proxy(url=u) for u in urls]
         self._idx = 0
 
@@ -75,16 +84,13 @@ class ProxyPool:
         return bool(self.proxies)
 
     def next_available(self) -> Proxy | None:
+        """从所有可用代理中随机选一个（打破确定性 Round-Robin 模式）。"""
         if not self.proxies:
             return None
-        n = len(self.proxies)
-        for _ in range(n):
-            p = self.proxies[self._idx % n]
-            self._idx += 1
-            if p.is_available():
-                return p
-        # 全部冷却中
-        return None
+        available = [p for p in self.proxies if p.is_available()]
+        if not available:
+            return None
+        return _random.choice(available)
 
     def get_bound(self, url: str) -> Proxy | None:
         """查找绑定到指定 URL 的代理。"""
@@ -92,6 +98,20 @@ class ProxyPool:
             if p.url == url:
                 return p if p.is_available() else None
         return None
+
+    def earliest_recovery(self) -> float | None:
+        """返回最快可用的代理还需等待的秒数；无代理或已有可用时返回 None。"""
+        if not self.proxies:
+            return None
+        now = time.time()
+        min_wait = None
+        for p in self.proxies:
+            if p.is_available():
+                return None  # 已有可用代理
+            wait = p.cooldown_until - now
+            if min_wait is None or wait < min_wait:
+                min_wait = wait
+        return max(min_wait, 0) if min_wait is not None else None
 
     def __len__(self) -> int:
         return len(self.proxies)

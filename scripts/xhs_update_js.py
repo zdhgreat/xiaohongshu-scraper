@@ -111,6 +111,18 @@ def update_js(dry_run: bool = False) -> dict[str, str]:
         else:
             results["xhs_xray.js"] = "not_found"
 
+        # 3b. xhs_xray pack 文件（xhs_xray.js 运行时 require 这两个 webpack bundle）
+        for pack_name in ("xhs_xray_pack1.js", "xhs_xray_pack2.js"):
+            src_pack = static_dir / pack_name
+            if src_pack.exists():
+                dst_pack = ASSETS / pack_name
+                if not dry_run:
+                    shutil.copy2(src_pack, dst_pack)
+                print(f"[UPDATE-JS] {pack_name} {'copied' if not dry_run else 'found'}", file=sys.stderr)
+                results[pack_name] = "updated" if not dry_run else "dry-run"
+            else:
+                results[pack_name] = "not_found"
+
     # 记录版本信息到 data/js_version.json
     if not dry_run and commit_short != "unknown":
         version_path = ROOT / "data" / "js_version.json"

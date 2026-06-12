@@ -32,19 +32,42 @@ WEB_BASE = "https://www.xiaohongshu.com"
 # ---------------------------------------------------------------------------
 # 核心参数
 # ---------------------------------------------------------------------------
-DAILY_HARD_CAP: int = 500
-COOKIE_REFRESH_EVERY: int = 20
-IMPERSONATE_PROFILE: str = "chrome131"
+DAILY_HARD_CAP: int = 80
+IP_DAILY_CAP: int = 80             # 同一 IP 每日总 API 请求上限（所有账号合计）
+DOM_SEARCH_DAILY_CAP: int = 100   # DOM 浏览器搜索日上限（独立计数，风控风险极低）
+COOKIE_REFRESH_EVERY: int = 20  # 已废弃：实际刷新间隔由 xhs_fetcher._maybe_refresh_cookies() 内部随机决定（15-25 次），此常量仅保留用于 data/config.json 兼容
+IMPERSONATE_PROFILE: str = "chrome136"
 IP_RATE_LIMIT: int = 10
 IP_RATE_WINDOW: int = 60
+
+# 搜索 API 小时配额（IP 级别，预防 -104 封锁）
+SEARCH_HOURLY_QUOTA: int = int(os.getenv("XHS_SEARCH_HOURLY_QUOTA", "3"))
+
+# 搜索模式: "api" = 优先API调用（需要签名，风控风险更高）, "dom" = 始终走浏览器DOM搜索（更安全）
+SEARCH_MODE: str = os.getenv("XHS_SEARCH_MODE", "dom")
 
 # ---------------------------------------------------------------------------
 # Keepalive：Cookie 自动保活
 # ---------------------------------------------------------------------------
 KEEPALIVE_PROFILE_TIMEOUT_S: int = 30    # Profile 恢复超时（秒）
-KEEPALIVE_DAEMON_INTERVAL_S: int = 3600  # 守护进程默认间隔（秒）
+KEEPALIVE_DAEMON_INTERVAL_S: int = 7200  # 守护进程默认间隔（秒，实际加抖动）
 KEEPALIVE_LOGIN_WAIT_S: int = 8          # 等待 session 恢复（秒）
 KEEPALIVE_FAIL_COOLDOWN_S: int = 7200    # 保活失败的短冷却（秒）
+
+# ---------------------------------------------------------------------------
+# 静默时段：深夜自动降速（模拟人类作息）
+# ---------------------------------------------------------------------------
+QUIET_HOURS_START: int = 1               # 静默开始（本地时间 24h 制）
+QUIET_HOURS_END: int = 6                 # 静默结束
+QUIET_HOURS_MULTIPLIER: float = float("inf")  # 静默期间完全停止
+
+# ---------------------------------------------------------------------------
+# 重登录：cookie 失效自动恢复
+# ---------------------------------------------------------------------------
+RELOGIN_MAX_ATTEMPTS: int = 3            # 每账号重登录最大尝试次数
+RELOGIN_COOLDOWN_MIN: int = 15           # 重登录失败后冷却（分钟）
+RELOGIN_PREDICTIVE_INTERVAL: int = 10    # 预测式检查：每 N 次请求触发一次
+COOKIE_PERSIST_INTERVAL: int = 20        # 每 N 次请求持久化 cookie 到磁盘
 
 # ---------------------------------------------------------------------------
 # Feed 分类
@@ -72,18 +95,8 @@ class SpeedProfile:
 
 
 SPEED_PROFILES: dict[str, SpeedProfile] = {
-    # normal：连发 3-6 个 → 停 20-60s → 再来一波；每 50 次强休 5-10min
-    "normal":   SpeedProfile((3, 6), (2.5, 5.5), (20, 60), 50, (300, 600)),
-    # slow：连发 2-4 个 → 停 60-150s → 再来一波；每 30 次强休 10-20min
-    "slow":     SpeedProfile((2, 4), (5, 12),    (60, 150), 30, (600, 1200)),
-    # paranoid：连发 1-2 个 → 停 3-8min → 再来一波；每 20 次强休 30min+
-    "paranoid": SpeedProfile((1, 2), (15, 30),   (180, 480), 20, (1500, 2400)),
-}
-
-SPEED_DOWNSHIFT: dict[str, str] = {
-    "normal": "slow",
-    "slow": "paranoid",
-    "paranoid": "paranoid",
+    # paranoid：唯一速度 — 每次 1 请求 → 停 4-10min → 每 15 次强休 15-30min
+    "paranoid": SpeedProfile((1, 1), (40, 80), (240, 600), 15, (900, 1800)),
 }
 
 
@@ -114,10 +127,10 @@ class Heartbeat:
 # ---------------------------------------------------------------------------
 USER_AGENT: str = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0"
+    "(KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
 )
 
-SEC_CH_UA: str = '"Chromium";v="131", "Not_A Brand";v="24", "Microsoft Edge";v="131"'
+SEC_CH_UA: str = '"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"'
 
 # ---------------------------------------------------------------------------
 # 设备指纹池 — 每个账号分配独立指纹，避免多号同设备
@@ -133,55 +146,81 @@ class FingerprintProfile:
     region: str = "CN"
 
 FINGERPRINT_POOL: list[FingerprintProfile] = [
-    # 0: Edge 131 / Windows
+    # Chrome 136 / Windows — 4 个变体
     FingerprintProfile(
-        user_agent=(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0"
-        ),
-        sec_ch_ua='"Chromium";v="131", "Not_A Brand";v="24", "Microsoft Edge";v="131"',
-        impersonate="chrome131",
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+        sec_ch_ua='"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"',
+        impersonate="chrome136",
         accept_language="zh-CN,zh;q=0.9,en;q=0.8",
     ),
-    # 1: Chrome 131 / Windows
     FingerprintProfile(
-        user_agent=(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-        ),
-        sec_ch_ua='"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
-        impersonate="chrome131",
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+        sec_ch_ua='"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"',
+        impersonate="chrome136",
         accept_language="zh-CN,zh;q=0.8,en-US;q=0.6,en;q=0.4",
     ),
-    # 2: Chrome 131 / Mac
     FingerprintProfile(
-        user_agent=(
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-        ),
-        sec_ch_ua='"Chromium";v="131", "Google Chrome";v="131", "Not_A Brand";v="24"',
-        impersonate="chrome131",
-        accept_language="zh-CN,zh;q=0.9,en;q=0.8",
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+        sec_ch_ua='"Chromium";v="136", "Google Chrome";v="136", "Not?A_Brand";v="99"',
+        impersonate="chrome136",
+        accept_language="zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
     ),
-    # 3: Edge 131 / Mac
     FingerprintProfile(
-        user_agent=(
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0"
-        ),
-        sec_ch_ua='"Chromium";v="131", "Not_A Brand";v="24", "Microsoft Edge";v="131"',
-        impersonate="chrome131",
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+        sec_ch_ua='"Chromium";v="136", "Google Chrome";v="136", "Not/A/Brand";v="99"',
+        impersonate="chrome136",
         accept_language="zh-CN,zh;q=0.9,en;q=0.7",
     ),
-    # 4: Chrome 131 / Windows (alternative)
+    # Chrome 136 / Mac — 3 个变体
     FingerprintProfile(
-        user_agent=(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-        ),
-        sec_ch_ua='"Chromium";v="131", "Google Chrome";v="131", "Not?A_Brand";v="99"',
-        impersonate="chrome131",
+        user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+        sec_ch_ua='"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"',
+        impersonate="chrome136",
+        accept_language="zh-CN,zh;q=0.9,en;q=0.8",
+    ),
+    FingerprintProfile(
+        user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+        sec_ch_ua='"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"',
+        impersonate="chrome136",
+        accept_language="zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.6",
+    ),
+    FingerprintProfile(
+        user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+        sec_ch_ua='"Chromium";v="136", "Google Chrome";v="136", "Not?A_Brand";v="99"',
+        impersonate="chrome136",
+        accept_language="zh-CN,zh;q=0.8,en-US;q=0.6,en;q=0.4",
+    ),
+    # Chrome 133 / Windows — 3 个变体（模拟稍旧但常见的版本）
+    FingerprintProfile(
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+        sec_ch_ua='"Chromium";v="133", "Google Chrome";v="133", "Not.A/Brand";v="99"',
+        impersonate="chrome133a",
+        accept_language="zh-CN,zh;q=0.9,en;q=0.8",
+    ),
+    FingerprintProfile(
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+        sec_ch_ua='"Chromium";v="133", "Google Chrome";v="133", "Not.A/Brand";v="99"',
+        impersonate="chrome133a",
+        accept_language="zh-CN,zh;q=0.8,en-US;q=0.6,en;q=0.4",
+    ),
+    FingerprintProfile(
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+        sec_ch_ua='"Chromium";v="133", "Google Chrome";v="133", "Not?A_Brand";v="99"',
+        impersonate="chrome133a",
         accept_language="zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+    ),
+    # Chrome 133 / Mac — 2 个变体
+    FingerprintProfile(
+        user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+        sec_ch_ua='"Chromium";v="133", "Google Chrome";v="133", "Not.A/Brand";v="99"',
+        impersonate="chrome133a",
+        accept_language="zh-CN,zh;q=0.9,en;q=0.8",
+    ),
+    FingerprintProfile(
+        user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+        sec_ch_ua='"Chromium";v="133", "Google Chrome";v="133", "Not.A/Brand";v="99"',
+        impersonate="chrome133a",
+        accept_language="zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.6",
     ),
 ]
 
@@ -194,20 +233,25 @@ def assign_fingerprint(alias: str) -> FingerprintProfile:
 
 
 def base_headers() -> dict[str, str]:
-    """完整模仿 Chrome 131 请求头集合。"""
+    """完整模仿 Chrome 请求头集合。
+
+    sec-ch-ua / user-agent / sec-ch-ua-platform / accept-language
+    由 Fetcher._apply_fingerprint() 根据账号指纹动态覆盖，
+    这里只提供默认值（指纹未加载时的兜底）。
+    """
     return {
         "accept": "application/json, text/plain, */*",
         "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
         "content-type": "application/json;charset=UTF-8",
         "origin": WEB_BASE,
         "referer": WEB_BASE + "/",
-        "sec-ch-ua": SEC_CH_UA,
+        "sec-ch-ua": SEC_CH_UA,       # 兜底值，会被指纹覆盖
         "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": '"Windows"',
+        "sec-ch-ua-platform": '"Windows"',  # 兜底值，会被指纹覆盖
         "sec-fetch-dest": "empty",
         "sec-fetch-mode": "cors",
         "sec-fetch-site": "same-site",
-        "user-agent": USER_AGENT,
+        "user-agent": USER_AGENT,     # 兜底值，会被指纹覆盖
     }
 
 # ---------------------------------------------------------------------------
@@ -269,9 +313,12 @@ def note_media_dir(note_id: str, conn=None) -> Path:
     return MEDIA_DIR / note_id
 
 # ---------------------------------------------------------------------------
-# Cookie 必需键
+# Cookie 必需键（缺失则判定无效，不可登录）
 # ---------------------------------------------------------------------------
 REQUIRED_COOKIE_KEYS: set[str] = {"web_session", "a1"}
+
+# Cookie 建议键（服务端 Set-Cookie 动态生成，缺失时风控风险升高但不阻断）
+OPTIONAL_COOKIE_KEYS: set[str] = {"websectiga", "sec_poison_id", "webId"}
 
 # ---------------------------------------------------------------------------
 # 共享工具函数
@@ -318,11 +365,15 @@ def apply_config() -> None:
     """
     cfg = load_config()
 
-    global DAILY_HARD_CAP, COOKIE_REFRESH_EVERY, IMPERSONATE_PROFILE
-    global USER_AGENT, SEC_CH_UA
+    global DAILY_HARD_CAP, IP_DAILY_CAP, DOM_SEARCH_DAILY_CAP, COOKIE_REFRESH_EVERY, IMPERSONATE_PROFILE
+    global USER_AGENT, SEC_CH_UA, SEARCH_MODE
 
     if "daily_hard_cap" in cfg:
         DAILY_HARD_CAP = int(cfg["daily_hard_cap"])
+    if "ip_daily_cap" in cfg:
+        IP_DAILY_CAP = int(cfg["ip_daily_cap"])
+    if "dom_search_daily_cap" in cfg:
+        DOM_SEARCH_DAILY_CAP = int(cfg["dom_search_daily_cap"])
     if "cookie_refresh_every" in cfg:
         COOKIE_REFRESH_EVERY = int(cfg["cookie_refresh_every"])
     if "impersonate_profile" in cfg:
@@ -331,12 +382,16 @@ def apply_config() -> None:
         USER_AGENT = str(cfg["user_agent"])
     if "sec_ch_ua" in cfg:
         SEC_CH_UA = str(cfg["sec_ch_ua"])
+    if "search_mode" in cfg:
+        mode = str(cfg["search_mode"])
+        if mode in ("api", "dom"):
+            SEARCH_MODE = mode
 
-    # Speed profile 覆盖
+    # Speed profile 覆盖（仅 paranoid）
     if "speed_profiles" in cfg:
         for name, vals in cfg["speed_profiles"].items():
-            if name in SPEED_PROFILES and isinstance(vals, dict):
-                sp = SPEED_PROFILES[name]
+            if name == "paranoid" and isinstance(vals, dict):
+                sp = SPEED_PROFILES["paranoid"]
                 if "burst_size" in vals:
                     sp.burst_size = tuple(vals["burst_size"])
                 if "burst_gap" in vals:
@@ -361,6 +416,44 @@ def apply_config() -> None:
             KEEPALIVE_LOGIN_WAIT_S = int(_ka["login_wait_s"])
         if "fail_cooldown_s" in _ka:
             KEEPALIVE_FAIL_COOLDOWN_S = int(_ka["fail_cooldown_s"])
+
+    # 静默时段配置
+    _qh = cfg.get("quiet_hours", {})
+    if _qh:
+        global QUIET_HOURS_START, QUIET_HOURS_END, QUIET_HOURS_MULTIPLIER
+        if "start" in _qh:
+            QUIET_HOURS_START = int(_qh["start"])
+        if "end" in _qh:
+            QUIET_HOURS_END = int(_qh["end"])
+        if "multiplier" in _qh:
+            QUIET_HOURS_MULTIPLIER = float(_qh["multiplier"])
+
+    # 重登录配置
+    _rl = cfg.get("relogin", {})
+    if _rl:
+        global RELOGIN_MAX_ATTEMPTS, RELOGIN_COOLDOWN_MIN, RELOGIN_PREDICTIVE_INTERVAL
+        if "max_attempts" in _rl:
+            RELOGIN_MAX_ATTEMPTS = int(_rl["max_attempts"])
+        if "cooldown_min" in _rl:
+            RELOGIN_COOLDOWN_MIN = int(_rl["cooldown_min"])
+        if "predictive_interval" in _rl:
+            RELOGIN_PREDICTIVE_INTERVAL = int(_rl["predictive_interval"])
+    if "cookie_persist_interval" in cfg:
+        global COOKIE_PERSIST_INTERVAL
+        COOKIE_PERSIST_INTERVAL = int(cfg["cookie_persist_interval"])
+
+    # 指纹池外部覆盖（由 updater 模块写入 data/config.json）
+    if "fingerprint_pool" in cfg:
+        pool_data = cfg["fingerprint_pool"]
+        if isinstance(pool_data, list) and len(pool_data) > 0:
+            FINGERPRINT_POOL.clear()
+            FINGERPRINT_POOL.extend([
+                FingerprintProfile(**fp) for fp in pool_data
+            ])
+            print(
+                f"[CONFIG] 指纹池已从 config.json 加载（{len(FINGERPRINT_POOL)} 个 profile）",
+                file=sys.stderr,
+            )
 
 
 # ---------------------------------------------------------------------------

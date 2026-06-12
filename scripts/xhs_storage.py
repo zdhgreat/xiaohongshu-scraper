@@ -12,12 +12,29 @@ import os
 import re
 import sqlite3
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
 from xhs_config import DB_PATH, MEDIA_DIR, OUTPUT_DIR, note_media_dir, sanitize_filename
+
+
+def _atomic_write(path: Path, content: str, encoding: str = "utf-8") -> None:
+    """原子写入文件：先写临时文件再 rename，防止崩溃时文件损坏。"""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    try:
+        tmp.write_text(content, encoding=encoding)
+        tmp.replace(path)
+    except Exception:
+        # replace 失败时清理临时文件
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS notes (
@@ -129,26 +146,54 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE notes ADD COLUMN image_mermaid TEXT DEFAULT ''")
     if "content_hash" not in cols:
         conn.execute("ALTER TABLE notes ADD COLUMN content_hash TEXT DEFAULT ''")
+    # v2 对齐 PG schema 的增强列
+    if "content" not in cols:
+        conn.execute("ALTER TABLE notes ADD COLUMN content TEXT DEFAULT ''")
+    if "note_url" not in cols:
+        conn.execute("ALTER TABLE notes ADD COLUMN note_url TEXT DEFAULT ''")
     conn.commit()
 
 
+_schema_done = False
+_checkpoint_done = False
+_init_lock = threading.Lock()
+
+
+def db_retry(fn, *args, retries=3, delay=1.0, **kwargs):
+    """执行 DB 操作，遇到 'database is locked' 自动重试。"""
+    for i in range(retries):
+        try:
+            return fn(*args, **kwargs)
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e).lower() and i < retries - 1:
+                time.sleep(delay * (i + 1))
+            else:
+                raise
+
+
 def connect() -> sqlite3.Connection:
+    global _checkpoint_done, _schema_done
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    # busy_timeout: 多进程并发写冲突时排队等 30 秒
+    # busy_timeout: 多进程/多线程并发写冲突时排队等 30 秒
     conn.execute("PRAGMA busy_timeout = 30000")
     # WAL 模式允许并发读 + 串行写；先查再设，避免重复执行
     jm = conn.execute("PRAGMA journal_mode").fetchone()
     if jm is None or jm[0] != "wal":
         conn.execute("PRAGMA journal_mode=WAL")
-    # 若上次进程异常退出，WAL 可能残留；尝试 checkpoint 清理
-    try:
-        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-    except Exception:
-        pass
-    conn.executescript(SCHEMA)
-    _migrate(conn)
+    # 一次性初始化（checkpoint + DDL）加锁，防止多线程重复执行
+    with _init_lock:
+        if not _checkpoint_done:
+            _checkpoint_done = True
+            try:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except Exception:
+                pass
+        if not _schema_done:
+            _schema_done = True
+            conn.executescript(SCHEMA)
+            _migrate(conn)
     return conn
 
 
@@ -163,14 +208,6 @@ def _create_in_memory() -> sqlite3.Connection:
 
 def upsert_note(conn: sqlite3.Connection, note: dict[str, Any]) -> None:
     content_hash = note.get("content_hash", "")
-    # 增量跳过：如果 content_hash 相同则不更新
-    if content_hash:
-        existing = conn.execute(
-            "SELECT content_hash FROM notes WHERE note_id = ?",
-            (note.get("note_id"),),
-        ).fetchone()
-        if existing and existing["content_hash"] == content_hash:
-            return  # 无变更，跳过
 
     # 注意：新增字段时必须同步更新下方 ON CONFLICT DO UPDATE SET 子句
     cols = (
@@ -178,8 +215,12 @@ def upsert_note(conn: sqlite3.Connection, note: dict[str, Any]) -> None:
         "comment_count share_count ip_location topics published_at "
         "xsec_token xsec_source video_url cover_url video_duration "
         "video_transcript video_ocr_text video_summary "
-        "image_ocr_text image_summary image_mermaid raw_json content_hash"
+        "image_ocr_text image_summary image_mermaid raw_json content_hash "
+        "content note_url"
     ).split()
+    # content: 优先用 description，PG 同步时 hub_adapter 会从 raw_json.desc 丰富
+    _content = note.get("description", "")
+    _note_url = f"https://www.xiaohongshu.com/explore/{note.get('note_id', '')}"
     values = [
         note.get("note_id"),
         note.get("user_id"),
@@ -206,14 +247,29 @@ def upsert_note(conn: sqlite3.Connection, note: dict[str, Any]) -> None:
         note.get("image_mermaid", ""),
         json.dumps(note.get("raw", {}), ensure_ascii=False),
         content_hash,
+        _content,
+        _note_url,
     ]
     # 防御性检查：确保 cols 数量与 values 数量一致
     assert len(cols) == len(values), f"upsert_note: cols({len(cols)}) != values({len(values)})"
     placeholders = ",".join("?" * len(cols))
     # 用 INSERT...ON CONFLICT，避免 INSERT OR REPLACE 把已有字段清成空
-    conn.execute(
-        f"INSERT INTO notes ({','.join(cols)}) VALUES ({placeholders}) "
-        f"ON CONFLICT(note_id) DO UPDATE SET "
+    # 遇到 database is locked 自动重试
+    # 增量跳过：content_hash 相同时跳过更新（事务内判断，避免并发竞态）
+    _skip_clause = ""
+    if content_hash:
+        _skip_clause = (
+            f"CASE WHEN notes.content_hash = ? THEN notes.content_hash ELSE excluded.content_hash END, "
+            f"crawled_at=CASE WHEN notes.content_hash = ? THEN notes.crawled_at ELSE CURRENT_TIMESTAMP END"
+        )
+        # 把 content_hash 值追加到 values 末尾供 CASE 参数使用
+        values_with_skip = values + [content_hash, content_hash]
+    else:
+        _skip_clause = "excluded.content_hash, crawled_at=CURRENT_TIMESTAMP"
+        values_with_skip = values
+
+    # 去掉末尾的 content_hash=... 和 crawled_at=...，由 _skip_clause 控制
+    _update_set = (
         f"user_id=excluded.user_id, title=excluded.title, description=excluded.description, "
         f"type=excluded.type, liked_count=excluded.liked_count, collected_count=excluded.collected_count, "
         f"comment_count=excluded.comment_count, share_count=excluded.share_count, "
@@ -229,9 +285,18 @@ def upsert_note(conn: sqlite3.Connection, note: dict[str, Any]) -> None:
         f"image_ocr_text=CASE WHEN excluded.image_ocr_text != '' THEN excluded.image_ocr_text ELSE notes.image_ocr_text END, "
         f"image_summary=CASE WHEN excluded.image_summary != '' THEN excluded.image_summary ELSE notes.image_summary END, "
         f"image_mermaid=CASE WHEN excluded.image_mermaid != '' THEN excluded.image_mermaid ELSE notes.image_mermaid END, "
-        f"raw_json=excluded.raw_json, content_hash=excluded.content_hash, crawled_at=CURRENT_TIMESTAMP",
-        values,
+        f"raw_json=CASE WHEN excluded.raw_json IS NOT NULL AND excluded.raw_json != '' AND (notes.raw_json IS NULL OR notes.raw_json = '' OR length(excluded.raw_json) > length(notes.raw_json)) THEN excluded.raw_json ELSE notes.raw_json END, "
+        f"content=CASE WHEN excluded.content != '' THEN excluded.content ELSE notes.content END, "
+        f"note_url=CASE WHEN excluded.note_url != '' THEN excluded.note_url ELSE COALESCE(notes.note_url, '') END, "
     )
+
+    db_retry(
+        conn.execute,
+        f"INSERT INTO notes ({','.join(cols)}) VALUES ({placeholders}) "
+        f"ON CONFLICT(note_id) DO UPDATE SET {_update_set} content_hash={_skip_clause}",
+        values_with_skip,
+    )
+    conn.commit()
 
 
 def update_video_analysis(
@@ -241,9 +306,10 @@ def update_video_analysis(
     ocr_text: str = "",
     summary: str = "",
 ) -> None:
-    """更新视频分析结果（转录 / OCR / 摘要），不影响其他字段。"""
+    """更新视频分析结果（转录 / OCR / 摘要），并刷新 crawled_at，不影响其他字段。"""
     conn.execute(
-        "UPDATE notes SET video_transcript=?, video_ocr_text=?, video_summary=? "
+        "UPDATE notes SET video_transcript=?, video_ocr_text=?, video_summary=?, "
+        "crawled_at=datetime('now') "
         "WHERE note_id=?",
         (transcript, ocr_text, summary, note_id),
     )
@@ -282,7 +348,7 @@ def upsert_user(conn: sqlite3.Connection, user: dict[str, Any]) -> None:
                follow_count = CASE WHEN excluded.follow_count > 0 THEN excluded.follow_count ELSE users.follow_count END,
                notes_count = CASE WHEN excluded.notes_count > 0 THEN excluded.notes_count ELSE users.notes_count END,
                location = COALESCE(NULLIF(excluded.location, ''), users.location),
-               raw_json = excluded.raw_json
+               raw_json = CASE WHEN excluded.raw_json IS NOT NULL AND excluded.raw_json != '' AND (users.raw_json IS NULL OR users.raw_json = '' OR length(excluded.raw_json) > length(users.raw_json)) THEN excluded.raw_json ELSE users.raw_json END
         """,
         (
             user_id,
@@ -296,6 +362,7 @@ def upsert_user(conn: sqlite3.Connection, user: dict[str, Any]) -> None:
             json.dumps(user.get("raw", {}), ensure_ascii=False),
         ),
     )
+    conn.commit()
 
 
 def save_search_page(
@@ -305,6 +372,7 @@ def save_search_page(
         "INSERT OR REPLACE INTO search_cache (keyword, page, note_ids_json) VALUES (?, ?, ?)",
         (keyword, page, json.dumps(note_ids, ensure_ascii=False)),
     )
+    conn.commit()
 
 
 def update_crawl_state(
@@ -336,9 +404,37 @@ def get_note(conn: sqlite3.Connection, note_id: str) -> sqlite3.Row | None:
     return cur.fetchone()
 
 
+def list_pending_corrections(conn: sqlite3.Connection, limit: int = 50) -> list[sqlite3.Row]:
+    """待纠错视频笔记：有转录、有 OCR 参照、尚未标记纠错（video_summary 为空）。"""
+    return conn.execute(
+        "SELECT note_id, title, video_transcript, video_ocr_text FROM notes "
+        "WHERE type='video' AND length(video_transcript) > 100 "
+        "AND video_ocr_text != '' AND video_ocr_text != '[]' "
+        "AND (video_summary = '' OR video_summary IS NULL) "
+        "ORDER BY rowid DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+
+
 def get_user(conn: sqlite3.Connection, user_id: str) -> sqlite3.Row | None:
     cur = conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
     return cur.fetchone()
+
+
+def resolve_user_id(conn: sqlite3.Connection, name_or_id: str) -> str | None:
+    """昵称 → user_id 查找。输入 user_id 则直接返回，输入昵称则查 DB。"""
+    # 尝试作为 user_id 精确匹配
+    row = conn.execute("SELECT user_id FROM users WHERE user_id = ?", (name_or_id,)).fetchone()
+    if row:
+        return row["user_id"]
+    # 按昵称查找（精确优先，然后模糊）
+    row = conn.execute("SELECT user_id FROM users WHERE nickname = ?", (name_or_id,)).fetchone()
+    if row:
+        return row["user_id"]
+    row = conn.execute("SELECT user_id FROM users WHERE nickname LIKE ?", (f"%{name_or_id}%",)).fetchone()
+    if row:
+        return row["user_id"]
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -359,7 +455,7 @@ def upsert_comment(conn: sqlite3.Connection, comment: dict[str, Any]) -> None:
                like_count = CASE WHEN excluded.like_count > 0 THEN excluded.like_count ELSE comments.like_count END,
                ip_location = COALESCE(NULLIF(excluded.ip_location, ''), comments.ip_location),
                pictures_json = excluded.pictures_json,
-               raw_json = excluded.raw_json
+               raw_json = CASE WHEN excluded.raw_json IS NOT NULL AND excluded.raw_json != '' AND (comments.raw_json IS NULL OR comments.raw_json = '' OR length(excluded.raw_json) > length(comments.raw_json)) THEN excluded.raw_json ELSE comments.raw_json END
         """,
         (
             comment_id,
@@ -376,6 +472,7 @@ def upsert_comment(conn: sqlite3.Connection, comment: dict[str, Any]) -> None:
             json.dumps(comment.get("raw", {}), ensure_ascii=False),
         ),
     )
+    conn.commit()
 
 
 def iter_comments(conn: sqlite3.Connection, note_id: str) -> Iterable[sqlite3.Row]:
@@ -657,28 +754,28 @@ def write_markdown_files(conn: sqlite3.Connection, note_id: str) -> list[Path]:
 
     # index.md（必有）
     index_content = _render_index(conn, ctx)
-    index_path.write_text(index_content, encoding="utf-8")
+    _atomic_write(index_path, index_content)
     files.append(index_path)
 
     # video.md（有视频分析时生成）
     video_content = _render_video_section(ctx)
     if video_content:
         path = note_dir / "video.md"
-        path.write_text(video_content, encoding="utf-8")
+        _atomic_write(path, video_content)
         files.append(path)
 
     # images.md（有图片分析时生成）
     images_content = _render_images_section(ctx)
     if images_content:
         path = note_dir / "images.md"
-        path.write_text(images_content, encoding="utf-8")
+        _atomic_write(path, images_content)
         files.append(path)
 
     # comments.md（有评论时生成）
     comments_content = _render_comments_section(conn, note_id)
     if comments_content:
         path = note_dir / "comments.md"
-        path.write_text(comments_content, encoding="utf-8")
+        _atomic_write(path, comments_content)
         files.append(path)
 
     return files
@@ -700,7 +797,11 @@ def _render_video_ocr(ocr_text: str) -> str:
         if not text or len(text) < 2 or text in seen:
             continue
         seen.add(text)
-        lines.append(f"- {text}")
+        time_label = item.get("time", "")
+        if time_label:
+            lines.append(f"- [{time_label}] {text}")
+        else:
+            lines.append(f"- {text}")
     return "\n".join(lines) if lines else ""
 
 
@@ -890,10 +991,7 @@ def write_json(conn: sqlite3.Connection, path: Path | None = None, user_id: str 
         d["topics"] = json.loads(d.get("topics") or "[]")
         d["raw_json"] = json.loads(d.get("raw_json") or "{}")
         notes.append(d)
-    path.write_text(
-        json.dumps(notes, ensure_ascii=False, indent=2, default=str),
-        encoding="utf-8",
-    )
+    _atomic_write(path, json.dumps(notes, ensure_ascii=False, indent=2, default=str))
     return path
 
 
