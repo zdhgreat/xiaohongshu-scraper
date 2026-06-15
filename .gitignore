@@ -1,9 +1,16 @@
 __pycache__/
 *.pyc
 *.bak
+node_modules/
 data/
 .venv/
 .env
 .claude/
+# 分析/运行报告，不入版本控制
+*报告*.md
+HYBRID_STRATEGY.md
+TECHNICAL_REPORT.md
+TECH_REPORT.md
+TOKEN_REFRESH_REPORT.md
 # Added by code-review-graph
 .code-review-graph/
